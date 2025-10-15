@@ -17,6 +17,36 @@ from typing import List, Tuple, Dict, Any
 import numpy as np
 import faiss
 import streamlit as st
+
+# --- Auto-download data bundle if missing ---
+import tarfile, tempfile, urllib.request
+
+def ensure_data_files():
+    paths = [
+        "data/index/faiss.index",
+        "data/index/metas.pkl",
+        "data/chunks/chunks.jsonl",
+        "data/catalog/video_meta.json",
+    ]
+    if all(os.path.exists(p) for p in paths):
+        return
+
+    url = os.getenv("DATA_URL")
+    if not url:
+        st.error("DATA_URL not set in secrets; cannot download data bundle.")
+        return
+
+    st.warning("Downloading prebuilt index bundle — please wait...")
+    tmp = tempfile.NamedTemporaryFile(delete=False)
+    urllib.request.urlretrieve(url, tmp.name)
+    with tarfile.open(tmp.name, "r:gz") as tar:
+        tar.extractall(".")
+
+    st.success("Data bundle extracted successfully.")
+
+ensure_data_files()
+
+
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
