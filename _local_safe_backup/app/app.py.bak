@@ -1,0 +1,61 @@
+import os, json, faiss, numpy as np
+import streamlit as st
+from pathlib import Path
+from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+
+load_dotenv()
+
+st.set_page_config(page_title="Longevity Q&A", layout="wide")
+
+index_fp = Path("data/index/faiss.index")
+meta_fp = Path("data/index/meta.jsonl")
+
+@st.cache_resource
+def load_index():
+    index = faiss.read_index(str(index_fp))
+    metas = []
+    with open(meta_fp, "r", encoding="utf-8") as f:
+        for line in f:
+            metas.append(json.loads(line))
+    model = SentenceTransformer(os.environ.get("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"))
+    return index, metas, model
+
+index, metas, model = load_index()
+
+st.title("Longevity Q&A")
+st.caption("Retrieval with timestamped citations from YouTube transcripts")
+
+q = st.text_input("Ask a question (e.g., 'morning light for sleep', 'blood pressure salt'):")
+topk = st.slider("Results", 1, 10, 5)
+
+if q:
+    qvec = model.encode([q], normalize_embeddings=True).astype("float32")
+    D, I = index.search(qvec, topk)
+    st.subheader("Top sources")
+    for rank, idx in enumerate(I[0]):
+        m = metas[int(idx)]
+        with st.expander(f"#{rank+1} • {m.get('title','')} • {m.get('channel','')}"):
+            st.write(m.get("text","")[:1000] + ("..." if len(m.get("text",""))>1000 else ""))
+            st.write(f"[Open at timestamp]({m.get('url','')})")
+    
+    # Optional: synthesis if OpenAI key is present
+    import os
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if api_key:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+            # Build a short context for the model
+            ctx = "\n\n".join([metas[int(i)]["text"][:1000] for i in I[0]])
+            prompt = f"Answer the user's question using only the context. Cite the video titles inline when relevant.\n\nQuestion: {q}\n\nContext:\n{ctx}\n\nAnswer:"
+            resp = client.chat.completions.create(
+                model=os.environ.get("OPENAI_MODEL","gpt-4o-mini"),
+                messages=[{"role":"user","content":prompt}],
+                temperature=0.2,
+                max_tokens=500
+            )
+            st.subheader("Draft answer")
+            st.write(resp.choices[0].message.content.strip())
+        except Exception as e:
+            st.info("Answer synthesis unavailable. Set OPENAI_API_KEY to enable.")
