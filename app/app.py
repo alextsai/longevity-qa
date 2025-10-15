@@ -19,16 +19,43 @@ import faiss
 import streamlit as st
 
 # --- Auto-download data bundle if missing ---
-import tarfile, tempfile, urllib.request
+import tarfile, tempfile, urllib.request, os
+
+def _safe_extract_flat(tar: tarfile.TarFile, dst: str):
+    """Extract bundle to dst, stripping one top-level folder if present."""
+    members = tar.getmembers()
+
+    # Detect a common top-level prefix (e.g. "data_bundle/")
+    def top_prefix(ms):
+        parts = [m.name.split('/', 1)[0] for m in ms if m.name]
+        return parts[0] if parts and all(p == parts[0] for p in parts) else ""
+
+    top = top_prefix(members)
+    dst_abs = os.path.abspath(dst) + os.sep
+
+    for m in members:
+        name = m.name
+        if top and name.startswith(top + "/"):
+            name = name[len(top) + 1:]
+        if not name:  # skip the top dir itself
+            continue
+
+        # prevent path traversal
+        out_path = os.path.abspath(os.path.join(dst, name))
+        if not out_path.startswith(dst_abs):
+            continue
+
+        m.name = name  # rewrite to our cleaned relative path
+        tar.extract(m, dst)
 
 def ensure_data_files():
-    paths = [
+    needed = [
         "data/index/faiss.index",
         "data/index/metas.pkl",
         "data/chunks/chunks.jsonl",
         "data/catalog/video_meta.json",
     ]
-    if all(os.path.exists(p) for p in paths):
+    if all(os.path.exists(p) for p in needed):
         return
 
     url = os.getenv("DATA_URL")
@@ -36,13 +63,18 @@ def ensure_data_files():
         st.error("DATA_URL not set in secrets; cannot download data bundle.")
         return
 
-    st.warning("Downloading prebuilt index bundle — please wait...")
+    st.warning("📦 Downloading pre-built index bundle — please wait (first run only)…")
     tmp = tempfile.NamedTemporaryFile(delete=False)
     urllib.request.urlretrieve(url, tmp.name)
-    with tarfile.open(tmp.name, "r:gz") as tar:
-        tar.extractall(".")
 
-    st.success("Data bundle extracted successfully.")
+    with tarfile.open(tmp.name, "r:gz") as tar:
+        _safe_extract_flat(tar, ".")
+
+    missing = [p for p in needed if not os.path.exists(p)]
+    if missing:
+        st.error(f"Bundle extracted, but missing: {missing}")
+    else:
+        st.success("✅ Data bundle extracted successfully!")
 
 ensure_data_files()
 
@@ -368,13 +400,12 @@ with st.chat_message("assistant"):
     st.markdown(answer)
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
-    # Sources (compact, always show)
-    st.markdown("**Sources & timestamps**")
-    for i, h in enumerate(hits, 1):
-        lbl, url = label_and_url(h["meta"])
-        if url:
-            st.markdown(f"{i}. [{lbl}]({url})")
-        else:
-            st.markdown(f"{i}. {lbl}")
-
-st.caption("Answers synthesize the indexed podcasters’ videos. If evidence is weak, I’ll say so.")
+    # Sources (collapsed by default)
+    with st.expander("Sources & timestamps", expanded=False):
+        for i, h in enumerate(hits, 1):
+            lbl, url = label_and_url(h["meta"])
+            if url:
+                st.markdown(f"{i}. [{lbl}]({url})")
+            else:
+                st.markdown(f"{i}. {lbl}")
+        st.caption("Answers synthesize the indexed podcasters’ videos. If evidence is weak, I’ll say so.")
