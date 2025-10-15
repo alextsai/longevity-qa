@@ -4,12 +4,14 @@
 # --- Ensure project root is importable (for utils.labels) ---
 from pathlib import Path
 import sys
+import os  # MUST be before DATA_ROOT usage
+
 ROOT = Path(__file__).resolve().parents[1]
+DATA_ROOT = Path(os.getenv("DATA_DIR", "."))  # where the data bundle lives/extracts
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 # ------------------------------------------------------------
 
-import os
 import json
 import pickle
 from typing import List, Tuple, Dict, Any
@@ -19,58 +21,68 @@ import faiss
 import streamlit as st
 
 # --- Auto-download data bundle if missing ---
-import tarfile, tempfile, urllib.request, os
+import tarfile, tempfile, urllib.request
 
-def _safe_extract_flat(tar: tarfile.TarFile, dst: str):
-    """Extract bundle to dst, stripping one top-level folder if present."""
+def _safe_extract_flat(tar: tarfile.TarFile, dst: Path):
+    """
+    Extract bundle into dst, stripping one top-level folder if present
+    and preventing path traversal.
+    """
+    dst = Path(dst)
+    dst.mkdir(parents=True, exist_ok=True)
     members = tar.getmembers()
 
-    # Detect a common top-level prefix (e.g. "data_bundle/")
     def top_prefix(ms):
-        parts = [m.name.split('/', 1)[0] for m in ms if m.name]
+        parts = [m.name.split("/", 1)[0] for m in ms if m.name]
         return parts[0] if parts and all(p == parts[0] for p in parts) else ""
 
     top = top_prefix(members)
-    dst_abs = os.path.abspath(dst) + os.sep
+    dst_abs = str(dst.resolve()) + os.sep
 
     for m in members:
         name = m.name
         if top and name.startswith(top + "/"):
             name = name[len(top) + 1:]
-        if not name:  # skip the top dir itself
+        if not name:
             continue
 
-        # prevent path traversal
-        out_path = os.path.abspath(os.path.join(dst, name))
-        if not out_path.startswith(dst_abs):
-            continue
+        out_path = (dst / name).resolve()
+        if not str(out_path).startswith(dst_abs):
+            continue  # block path traversal
 
-        m.name = name  # rewrite to our cleaned relative path
-        tar.extract(m, dst)
+        # rewrite member to cleaned relative path
+        m.name = name
+        tar.extract(m, str(dst))
 
 def ensure_data_files():
+    """
+    If the FAISS index/chunks/meta are missing under DATA_ROOT, fetch DATA_URL
+    and extract there. DATA_URL must be set in Streamlit secrets/env.
+    """
     needed = [
-        "data/index/faiss.index",
-        "data/index/metas.pkl",
-        "data/chunks/chunks.jsonl",
-        "data/catalog/video_meta.json",
+        DATA_ROOT / "data/index/faiss.index",
+        DATA_ROOT / "data/index/metas.pkl",
+        DATA_ROOT / "data/chunks/chunks.jsonl",
+        DATA_ROOT / "data/catalog/video_meta.json",
     ]
-    if all(os.path.exists(p) for p in needed):
+    if all(p.exists() for p in needed):
         return
 
     url = os.getenv("DATA_URL")
     if not url:
-        st.error("DATA_URL not set in secrets; cannot download data bundle.")
+        st.error("DATA_URL not set; cannot download data bundle.")
         return
 
     st.warning("📦 Downloading pre-built index bundle — please wait (first run only)…")
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+
     tmp = tempfile.NamedTemporaryFile(delete=False)
     urllib.request.urlretrieve(url, tmp.name)
 
     with tarfile.open(tmp.name, "r:gz") as tar:
-        _safe_extract_flat(tar, ".")
+        _safe_extract_flat(tar, DATA_ROOT)
 
-    missing = [p for p in needed if not os.path.exists(p)]
+    missing = [str(p) for p in needed if not p.exists()]
     if missing:
         st.error(f"Bundle extracted, but missing: {missing}")
     else:
@@ -79,6 +91,13 @@ def ensure_data_files():
 ensure_data_files()
 
 
+# Pre-warm caches so first user doesn't wait
+try:
+    _ = load_index_and_model()
+    _ = load_chunks_aligned()
+except Exception:
+    pass
+
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
@@ -86,12 +105,12 @@ from openai import OpenAI
 from utils.labels import label_and_url  # signature: label_and_url(meta) -> (label, url)
 
 # -------------------------
-# Paths
+# Paths (all under DATA_ROOT)
 # -------------------------
-CHUNKS_PATH = ROOT / "data/chunks/chunks.jsonl"
-INDEX_PATH = ROOT / "data/index/faiss.index"
-METAS_PKL = ROOT / "data/index/metas.pkl"
-VIDEO_META_JSON = ROOT / "data/catalog/video_meta.json"
+CHUNKS_PATH     = DATA_ROOT / "data/chunks/chunks.jsonl"
+INDEX_PATH      = DATA_ROOT / "data/index/faiss.index"
+METAS_PKL       = DATA_ROOT / "data/index/metas.pkl"
+VIDEO_META_JSON = DATA_ROOT / "data/catalog/video_meta.json"
 
 # -------------------------
 # Small helpers
