@@ -12,3 +12,11 @@ data/chunks/chunks.jsonl
 
 # bundles
 *.tgz
+.venv/
+data/raw_vtt/
+data/vtt/
+data/index/
+data/chunks/
+.DS_Store
+backups/
+_backup_*
