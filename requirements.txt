@@ -1,0 +1,7 @@
+streamlit>=1.36
+openai>=1.40
+sentence-transformers>=3.0
+faiss-cpu>=1.8
+numpy>=1.26
+tqdm>=4.66
+webvtt-py>=0.4
