@@ -1,11 +1,14 @@
-# data we’ll ship outside git
-data/chunks/
-data/index/
+# env & cache
+.venv/
+__pycache__/
+.DS_Store
+
+# raw/downloaded data (bundled via DATA_URL instead)
 data/raw_vtt/
 data/vtt/
-data/catalog/video_meta.json.bak
-backups/
-_backup_*/
-# misc
+data/index/faiss.index
+data/index/metas.pkl
+data/chunks/chunks.jsonl
+
+# bundles
 *.tgz
-.DS_Store
