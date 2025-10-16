@@ -1,9 +1,11 @@
 # app/app.py
 # -*- coding: utf-8 -*-
 
-from __future__ import annotations
 from pathlib import Path
-import os, sys, json, pickle
+import os
+import sys
+import json
+import pickle
 from typing import List, Tuple, Dict, Any
 
 import streamlit as st
@@ -12,37 +14,29 @@ import faiss
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Paths / imports
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Helper that builds a human label+URL from a meta dict
-from utils.labels import label_and_url
+# All data lives under DATA_DIR (Render persistent disk defaults to /var/data)
+DATA_ROOT = Path(os.getenv("DATA_DIR", "/var/data")).resolve()
 
-# All data must already exist under DATA_DIR (Render disk, e.g. /var/data)
-DATA_ROOT = Path(os.getenv("DATA_DIR", ".")).resolve()
+from utils.labels import label_and_url  # uses data/catalog/video_meta.json
 
-def _resolve(rel: str) -> Path:
-    """
-    Try DATA_DIR/data/<rel> first (your current layout),
-    and fall back to DATA_DIR/<rel> if needed.
-    """
-    p1 = DATA_ROOT / "data" / rel
-    if p1.exists():
-        return p1
-    return DATA_ROOT / rel
+# -----------------------------------------------------------------------------
+# Constants: where files are expected (under DATA_ROOT)
+# -----------------------------------------------------------------------------
+CHUNKS_PATH     = DATA_ROOT / "data/chunks/chunks.jsonl"
+INDEX_PATH      = DATA_ROOT / "data/index/faiss.index"
+METAS_PKL       = DATA_ROOT / "data/index/metas.pkl"
+VIDEO_META_JSON = DATA_ROOT / "data/catalog/video_meta.json"
 
-CHUNKS_PATH      = _resolve("chunks/chunks.jsonl")
-INDEX_PATH       = _resolve("index/faiss.index")
-METAS_PKL        = _resolve("index/metas.pkl")
-VIDEO_META_JSON  = _resolve("catalog/video_meta.json")
-
-# ------------------------------------------------------------
-# Small helpers
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 def _parse_ts(v) -> float:
     if isinstance(v, (int, float)):
         try:
@@ -60,9 +54,9 @@ def _parse_ts(v) -> float:
             return 0.0
     return 0.0
 
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Data loaders (cached)
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_video_meta() -> Dict[str, Dict[str, str]]:
     if VIDEO_META_JSON.exists():
@@ -75,15 +69,18 @@ def load_video_meta() -> Dict[str, Dict[str, str]]:
 @st.cache_resource(show_spinner=False)
 def load_chunks_aligned() -> Tuple[List[str], List[dict]]:
     """Load chunk texts + metas, normalizing video_id and start timestamp."""
-    texts, metas = [], []
+    texts: List[str] = []
+    metas: List[dict] = []
     if not CHUNKS_PATH.exists():
         return texts, metas
+
     with CHUNKS_PATH.open(encoding="utf-8") as f:
         for line in f:
             try:
                 j = json.loads(line)
             except Exception:
                 continue
+
             txt = (j.get("text") or "").strip()
             m = (j.get("meta") or {}).copy()
 
@@ -106,6 +103,7 @@ def load_chunks_aligned() -> Tuple[List[str], List[dict]]:
             if txt:
                 texts.append(txt)
                 metas.append(m)
+
     return texts, metas
 
 @st.cache_resource(show_spinner=False)
@@ -113,17 +111,20 @@ def load_index_and_model():
     """Load FAISS index + metas.pkl (model name, metas)."""
     if not INDEX_PATH.exists() or not METAS_PKL.exists():
         return None, None, None
+
     index = faiss.read_index(str(INDEX_PATH))
     with METAS_PKL.open("rb") as f:
         payload = pickle.load(f)
+
     metas = payload.get("metas", [])
     model_name = payload.get("model", "sentence-transformers/all-MiniLM-L6-v2")
     embedder = SentenceTransformer(model_name)
+
     return index, metas, {"model_name": model_name, "embedder": embedder}
 
-# ------------------------------------------------------------
-# Retrieval (FAISS-only)
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Retrieval
+# -----------------------------------------------------------------------------
 def search_chunks(
     query: str,
     index: faiss.Index,
@@ -136,13 +137,14 @@ def search_chunks(
 ) -> List[Dict[str, Any]]:
     if not query.strip():
         return []
+
     q_emb = embedder.encode([query], normalize_embeddings=True).astype("float32")
     K = min(int(initial_k), len(texts))
     D, I = index.search(q_emb, K)
     indices = I[0].tolist()
     scores = D[0].tolist()
 
-    hits = []
+    hits: List[Dict[str, Any]] = []
     for idx, score in zip(indices, scores):
         if idx < 0 or idx >= len(texts):
             continue
@@ -155,28 +157,31 @@ def search_chunks(
         hits.append({"i": idx, "score": float(score), "text": texts[idx], "meta": meta})
 
     # Cap per-video and trim to final_k
-    counts = {}
-    capped = []
+    counts: Dict[str, int] = {}
+    capped: List[Dict[str, Any]] = []
+    cap = max(1, int(per_video_cap))
+
     for h in hits:
         vid = h["meta"].get("video_id")
         counts[vid] = counts.get(vid, 0) + 1
-        if counts[vid] <= max(1, int(per_video_cap)):
+        if counts[vid] <= cap:
             capped.append(h)
         if len(capped) >= int(final_k):
             break
+
     return capped
 
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Answer synthesis (OpenAI)
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def openai_answer(model_name: str, question: str, history: List[Dict[str, str]], hits: List[Dict[str, Any]]) -> str:
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         return "⚠️ OPENAI_API_KEY is not set. Export it and try again."
 
-    # Keep a small recent history for conversational continuity
+    # Keep last ~6 turns for conversational context
     recent = history[-6:]
-    convo = []
+    convo: List[str] = []
     for m in recent:
         role = m.get("role")
         content = m.get("content", "")
@@ -184,24 +189,23 @@ def openai_answer(model_name: str, question: str, history: List[Dict[str, str]],
             label = "User" if role == "user" else "Assistant"
             convo.append(f"{label}: {content}")
 
-    # Evidence block
-    lines = []
+    # Build evidence block
+    lines: List[str] = []
     for i, h in enumerate(hits, 1):
         lbl, _ = label_and_url(h["meta"])
         lines.append(f"[{i}] {lbl}\n{h['text']}\n")
 
-system = (
-    "You are a careful assistant that answers using ONLY the provided video excerpts.\n"
-    "Rules:\n"
-    "• Do not invent facts. If something contradicts skip it.\n"
-    "• If evidence is insufficient or unclear, say you don't know.\n"
-    "• Be practical and concise; avoid medical diagnosis—suggest consulting a clinician when appropriate.\n"
-    "• You may keep conversational continuity, but all factual claims must be grounded in the excerpts and facts.\n"
-    "Output must be plain Markdown only—never return HTML, <style>, or <script> tags."
-)
+    system = (
+        "You are a careful assistant that answers using ONLY the provided video excerpts.\n"
+        "Rules:\n"
+        "• Never contradict the excerpts; do not invent facts.\n"
+        "• If evidence is insufficient or unclear, say you don't know.\n"
+        "• Be practical and concise; avoid medical diagnosis—suggest consulting a clinician when appropriate.\n"
+        "• You may keep conversational continuity, but all factual claims must be grounded in the excerpts."
+    )
 
     user_payload = (
-        ("Recent conversation:\n" + "\n".join(convo) + "\n\n") if convo else ""
+        ("Recent conversation to preserve context:\n" + "\n".join(convo) + "\n\n") if convo else ""
     ) + (
         f"Question: {question}\n\nExcerpts:\n" + "\n".join(lines) +
         "\nWrite the best possible answer fully consistent with these excerpts. "
@@ -222,55 +226,61 @@ system = (
     except Exception as e:
         return f"⚠️ Generation error: {e}"
 
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # UI
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
 st.set_page_config(page_title="Longevity / Nutrition Q&A", page_icon="🍎", layout="wide")
 
 with st.sidebar:
     st.header("Settings")
     st.markdown(
-        "These settings control **how the AI searches your video library and builds answers**. "
-        "You can adjust them anytime — the defaults work well."
+        "These settings control **how the AI searches your video library and builds answers**.\n\n"
+        "You can adjust them anytime — the defaults work well for most questions."
     )
+
     initial_k = st.number_input("Initial candidates (FAISS)", min_value=20, max_value=2000, value=320, step=20)
     final_k = st.number_input("Final evidence chunks", min_value=5, max_value=200, value=80, step=5)
     per_video_cap = st.number_input("Max chunks per video", min_value=1, max_value=50, value=12, step=1)
 
-    model_choice = st.selectbox("OpenAI model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"], index=0)
+    st.subheader("OpenAI model")
+    model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"], index=0)
+    st.session_state["model_choice"] = model_choice
 
     st.divider()
     st.subheader("Index status (under DATA_DIR)")
     st.caption(f"DATA_DIR = `{DATA_ROOT}`")
-    st.checkbox(str(CHUNKS_PATH.relative_to(DATA_ROOT)), value=CHUNKS_PATH.exists(), disabled=True)
-    st.checkbox(str(INDEX_PATH.relative_to(DATA_ROOT)), value=INDEX_PATH.exists(), disabled=True)
-    st.checkbox(str(METAS_PKL.relative_to(DATA_ROOT)), value=METAS_PKL.exists(), disabled=True)
-    st.checkbox(str(VIDEO_META_JSON.relative_to(DATA_ROOT)), value=VIDEO_META_JSON.exists(), disabled=True)
+    st.checkbox("data/chunks/chunks.jsonl", value=CHUNKS_PATH.exists(), disabled=True)
+    st.checkbox("data/index/faiss.index", value=INDEX_PATH.exists(), disabled=True)
+    st.checkbox("data/index/metas.pkl", value=METAS_PKL.exists(), disabled=True)
+    st.checkbox("data/catalog/video_meta.json", value=VIDEO_META_JSON.exists(), disabled=True)
 
-    # Quick stats
     texts_cache, metas_cache = load_chunks_aligned()
     st.markdown(f"**Chunks indexed:** {len(texts_cache):,}")
+
     vm = load_video_meta()
-    if vm and metas_cache:
-        counts: Dict[str, int] = {}
-        for m in metas_cache:
-            vid = m.get("video_id")
-            if not vid:
-                continue
-            info = vm.get(vid, {})
-            ch = (info.get("channel") or m.get("channel") or m.get("uploader") or "").strip() or "Unknown"
-            counts[ch] = counts.get(ch, 0) + 1
-        if counts:
-            st.subheader("Primary sources")
-            for ch, cnt in sorted(counts.items(), key=lambda x: x[1], reverse=True)[:4]:
-                st.markdown(f"- **{ch}** — {cnt:,} chunks")
+    channel_counts: Dict[str, int] = {}
+    for m in metas_cache:
+        vid = m.get("video_id")
+        if not vid:
+            continue
+        info = vm.get(vid, {})
+        ch = (info.get("channel") or m.get("channel") or m.get("uploader") or "").strip()
+        if not ch:
+            ch = "Unknown"
+        channel_counts[ch] = channel_counts.get(ch, 0) + 1
+
+    if channel_counts:
+        st.subheader("Primary sources")
+        for ch, cnt in sorted(channel_counts.items(), key=lambda x: x[1], reverse=True)[:4]:
+            st.markdown(f"- **{ch}** — {cnt:,} chunks")
 
 st.title("Longevity / Nutrition Q&A")
 
-# Prompt box
+# Chat history
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.session_state.messages = []  # list of {"role":"user"/"assistant", "content": str}
 
+# Render history
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
@@ -279,17 +289,7 @@ prompt = st.chat_input("Ask about sleep, protein timing, fasting, supplements, p
 if prompt is None:
     st.stop()
 
-# Validate files before doing anything
-missing = [p for p in [CHUNKS_PATH, INDEX_PATH, METAS_PKL, VIDEO_META_JSON] if not p.exists()]
-if missing:
-    st.error(
-        "Required index files were not found in `DATA_DIR`. "
-        "Please copy them to your persistent disk and redeploy.\n\n"
-        + "\n".join(f"- {p}" for p in missing)
-    )
-    st.stop()
-
-# Record user msg
+# show user message
 st.session_state.messages.append({"role": "user", "content": prompt})
 with st.chat_message("user"):
     st.markdown(prompt)
@@ -298,15 +298,36 @@ with st.chat_message("user"):
 index, metas_from_pkl, payload = load_index_and_model()
 texts, metas = load_chunks_aligned()
 
+# hard guardrails on missing files
+missing_bits = []
+if not INDEX_PATH.exists():
+    missing_bits.append("index/faiss.index")
+if not METAS_PKL.exists():
+    missing_bits.append("index/metas.pkl")
+if not CHUNKS_PATH.exists():
+    missing_bits.append("chunks/chunks.jsonl")
+if not VIDEO_META_JSON.exists():
+    missing_bits.append("catalog/video_meta.json")
+
+if missing_bits:
+    with st.chat_message("assistant"):
+        st.error(
+            "Required files are missing under DATA_DIR. Missing: "
+            + ", ".join(missing_bits)
+            + "\n\nEnsure they exist under "
+            + f"{DATA_ROOT}/data/..."
+        )
+    st.stop()
+
 if index is None or payload is None or not texts:
     with st.chat_message("assistant"):
-        st.error("FAISS index / metas / chunks not available. Rebuild or place files under DATA_DIR and redeploy.")
+        st.error("FAISS index / metas / chunks not found or failed to load.")
     st.stop()
 
 embedder = payload["embedder"]
-metas_list = metas  # aligned to chunks order
+metas_list = metas  # aligned with CHUNKS_PATH order
 
-# Search
+# Retrieve
 with st.spinner("Searching sources…"):
     hits = search_chunks(
         prompt,
@@ -323,21 +344,13 @@ with st.spinner("Searching sources…"):
 with st.chat_message("assistant"):
     if not hits:
         st.warning("No sources found for this answer.")
-        st.session_state.messages.append(
-            {"role": "assistant", "content": "I couldn’t find relevant excerpts for that."}
-        )
+        st.session_state.messages.append({"role": "assistant", "content": "I couldn’t find relevant excerpts for that."})
         st.stop()
 
     with st.spinner("Synthesizing answer…"):
-        answer = openai_answer(
-            st.session_state.get("model_choice", model_choice),
-            prompt,
-            st.session_state.messages,
-            hits,
-        )
+        answer = openai_answer(st.session_state.get("model_choice", model_choice), prompt, st.session_state.messages, hits)
 
-    # Render answer; allow any HTML the model might emit
-    st.markdown(answer, unsafe_allow_html=True)
+    st.markdown(answer)
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
     with st.expander("Sources & timestamps", expanded=False):
