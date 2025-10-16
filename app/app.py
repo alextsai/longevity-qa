@@ -190,12 +190,15 @@ def openai_answer(model_name: str, question: str, history: List[Dict[str, str]],
         lbl, _ = label_and_url(h["meta"])
         lines.append(f"[{i}] {lbl}\n{h['text']}\n")
 
-    system = (
-        "You are a careful assistant that answers using ONLY the provided video excerpts.\n"
-        "• Never contradict the excerpts; do not invent facts.\n"
-        "• If evidence is insufficient or unclear, say you don't know.\n"
-        "• Be practical and concise; avoid medical diagnosis—suggest consulting a clinician when appropriate."
-    )
+system = (
+    "You are a careful assistant that answers using ONLY the provided video excerpts.\n"
+    "Rules:\n"
+    "• Do not invent facts. If something contradicts skip it.\n"
+    "• If evidence is insufficient or unclear, say you don't know.\n"
+    "• Be practical and concise; avoid medical diagnosis—suggest consulting a clinician when appropriate.\n"
+    "• You may keep conversational continuity, but all factual claims must be grounded in the excerpts and facts.\n"
+    "Output must be plain Markdown only—never return HTML, <style>, or <script> tags."
+)
 
     user_payload = (
         ("Recent conversation:\n" + "\n".join(convo) + "\n\n") if convo else ""
@@ -320,13 +323,21 @@ with st.spinner("Searching sources…"):
 with st.chat_message("assistant"):
     if not hits:
         st.warning("No sources found for this answer.")
-        st.session_state.messages.append({"role": "assistant", "content": "I couldn’t find relevant excerpts for that."})
+        st.session_state.messages.append(
+            {"role": "assistant", "content": "I couldn’t find relevant excerpts for that."}
+        )
         st.stop()
 
     with st.spinner("Synthesizing answer…"):
-        answer = openai_answer(st.session_state.get("model_choice", model_choice), prompt, st.session_state.messages, hits)
+        answer = openai_answer(
+            st.session_state.get("model_choice", model_choice),
+            prompt,
+            st.session_state.messages,
+            hits,
+        )
 
-    st.markdown(answer)
+    # Render answer; allow any HTML the model might emit
+    st.markdown(answer, unsafe_allow_html=True)
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
     with st.expander("Sources & timestamps", expanded=False):
