@@ -1,10 +1,7 @@
 streamlit==1.50.0
-openai>=1.40
-# Smaller, CPU-only stack (works with Py 3.11)
+openai==2.4.0
 sentence-transformers==2.2.2
-torch==2.9.0
-transformers==4.37.2
-faiss-cpu==1.8.0.post1
-numpy==1.26.4
+torch==2.9.0          # CPU wheel for py3.13 is available
+faiss-cpu==1.12.0     # <-- fixes the current build error
 tqdm>=4.66
-webvtt-py>=0.5.1
+webvtt-py>=0.4
