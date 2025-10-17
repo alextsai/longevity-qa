@@ -2,7 +2,7 @@ streamlit==1.50.0
 openai>=1.40
 # Smaller, CPU-only stack (works with Py 3.11)
 sentence-transformers==2.2.2
-torch==2.2.2
+torch==2.9.0
 transformers==4.37.2
 faiss-cpu==1.8.0.post1
 numpy==1.26.4
