@@ -1,6 +1,6 @@
 streamlit==1.50.0
 openai>=1.40
-# Light, CPU-only stack to avoid 2GB OOM
+# Smaller, CPU-only stack (works with Py 3.11)
 sentence-transformers==2.2.2
 torch==2.2.2
 transformers==4.37.2
