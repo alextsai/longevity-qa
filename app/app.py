@@ -344,11 +344,23 @@ with st.spinner("Searching sources…"):
 with st.chat_message("assistant"):
     if not hits:
         st.warning("No sources found for this answer.")
-        st.session_state.messages.append({"role": "assistant", "content": "I couldn’t find relevant excerpts for that."})
+        st.session_state.messages.append(
+            {"role": "assistant", "content": "I couldn’t find relevant excerpts for that."}
+        )
         st.stop()
 
     with st.spinner("Synthesizing answer…"):
-        answer = openai_answer(st.session_state.get("model_choice", model_choice), prompt, st.session_state.messages, hits)
+        try:
+            answer = openai_answer(
+                st.session_state.get("model_choice", model_choice),
+                prompt,
+                st.session_state.messages,
+                hits,
+            )
+        except Exception as e:
+            st.error("OpenAI request failed. See error details below.")
+            st.exception(e)
+            raise
 
     st.markdown(answer)
     st.session_state.messages.append({"role": "assistant", "content": answer})
@@ -356,8 +368,5 @@ with st.chat_message("assistant"):
     with st.expander("Sources & timestamps", expanded=False):
         for i, h in enumerate(hits, 1):
             lbl, url = label_and_url(h["meta"])
-            if url:
-                st.markdown(f"{i}. [{lbl}]({url})")
-            else:
-                st.markdown(f"{i}. {lbl}")
+            st.markdown(f"{i}. [{lbl}]({url})" if url else f"{i}. {lbl}")
         st.caption("Answers synthesize the indexed podcasters’ videos. If evidence is weak, I’ll say so.")
