@@ -1,7 +1,10 @@
-streamlit>=1.36
+streamlit==1.50.0
 openai>=1.40
-sentence-transformers>=3.0
-faiss-cpu>=1.8
-numpy>=1.26
+# Light, CPU-only stack to avoid 2GB OOM
+sentence-transformers==2.2.2
+torch==2.2.2
+transformers==4.37.2
+faiss-cpu==1.8.0.post1
+numpy==1.26.4
 tqdm>=4.66
-webvtt-py>=0.4
+webvtt-py>=0.5.1
