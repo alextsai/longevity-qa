@@ -6,12 +6,11 @@ import os
 import sys
 import json
 import pickle
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional, Callable
 
 import streamlit as st
 import numpy as np
 import faiss
-from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
 # -----------------------------------------------------------------------------
@@ -108,7 +107,7 @@ def load_chunks_aligned() -> Tuple[List[str], List[dict]]:
 
 @st.cache_resource(show_spinner=False)
 def load_index_and_model():
-    """Load FAISS index + metas.pkl (model name, metas)."""
+    """Load FAISS index + metas.pkl. Returns (index, metas, model_name)."""
     if not INDEX_PATH.exists() or not METAS_PKL.exists():
         return None, None, None
 
@@ -117,10 +116,51 @@ def load_index_and_model():
         payload = pickle.load(f)
 
     metas = payload.get("metas", [])
-    model_name = payload.get("model", "sentence-transformers/all-MiniLM-L6-v2")
-    embedder = SentenceTransformer(model_name)
+    model_name = payload.get("model", "text-embedding-3-small")
+    return index, metas, model_name
 
-    return index, metas, {"model_name": model_name, "embedder": embedder}
+# -----------------------------------------------------------------------------
+# Query embedding (lazy; supports OpenAI or SBERT)
+# -----------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def _load_sbert(model_name: str):
+    # Imported lazily to avoid import-time crashes when not needed.
+    from sentence_transformers import SentenceTransformer
+    import torch  # noqa: F401
+    try:
+        import torch
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+    return SentenceTransformer(model_name)
+
+def _normalize(v: np.ndarray) -> np.ndarray:
+    # L2-normalize to match typical inner-product FAISS setups
+    if v.ndim == 1:
+        v = v.reshape(1, -1)
+    n = np.linalg.norm(v, axis=1, keepdims=True) + 1e-12
+    return (v / n).astype("float32")
+
+def make_query_encoder(model_name: str) -> Callable[[str], np.ndarray]:
+    """
+    Returns a function that maps a query string -> float32 embedding row vector.
+    If the index was built with OpenAI embeddings, use OpenAI.
+    Otherwise fall back to SBERT (lazy-loaded).
+    """
+    if model_name.startswith("text-embedding-"):
+        client = OpenAI()
+        def _enc(q: str) -> np.ndarray:
+            resp = client.embeddings.create(model=model_name, input=q)
+            vec = np.array(resp.data[0].embedding, dtype="float32")
+            return _normalize(vec)
+        return _enc
+    else:
+        # SBERT path (e.g., all-MiniLM-L6-v2)
+        sbert = _load_sbert(model_name)
+        def _enc(q: str) -> np.ndarray:
+            vec = sbert.encode([q], normalize_embeddings=True)
+            return vec.astype("float32")
+        return _enc
 
 # -----------------------------------------------------------------------------
 # Retrieval
@@ -128,7 +168,7 @@ def load_index_and_model():
 def search_chunks(
     query: str,
     index: faiss.Index,
-    embedder: SentenceTransformer,
+    encode_query: Callable[[str], np.ndarray],
     metas: List[dict],
     texts: List[str],
     initial_k: int,
@@ -138,8 +178,9 @@ def search_chunks(
     if not query.strip():
         return []
 
-    q_emb = embedder.encode([query], normalize_embeddings=True).astype("float32")
-    K = min(int(initial_k), len(texts))
+    q_emb = encode_query(query)
+    # Cap K to index size
+    K = min(int(initial_k), getattr(index, "ntotal", len(texts)))
     D, I = index.search(q_emb, K)
     indices = I[0].tolist()
     scores = D[0].tolist()
@@ -295,7 +336,7 @@ with st.chat_message("user"):
     st.markdown(prompt)
 
 # Load resources
-index, metas_from_pkl, payload = load_index_and_model()
+index, metas_from_pkl, model_used_for_index = load_index_and_model()
 texts, metas = load_chunks_aligned()
 
 # hard guardrails on missing files
@@ -319,26 +360,40 @@ if missing_bits:
         )
     st.stop()
 
-if index is None or payload is None or not texts:
+if index is None or model_used_for_index is None or not texts:
     with st.chat_message("assistant"):
         st.error("FAISS index / metas / chunks not found or failed to load.")
     st.stop()
 
-embedder = payload["embedder"]
+# Build the query encoder based on how the index was built
+try:
+    encode_query = make_query_encoder(model_used_for_index)
+except Exception as e:
+    with st.chat_message("assistant"):
+        st.error("Failed to prepare query encoder.")
+        st.exception(e)
+    st.stop()
+
 metas_list = metas  # aligned with CHUNKS_PATH order
 
 # Retrieve
 with st.spinner("Searching sources…"):
-    hits = search_chunks(
-        prompt,
-        index=index,
-        embedder=embedder,
-        metas=metas_list,
-        texts=texts,
-        initial_k=int(initial_k),
-        final_k=int(final_k),
-        per_video_cap=int(per_video_cap),
-    )
+    try:
+        hits = search_chunks(
+            prompt,
+            index=index,
+            encode_query=encode_query,
+            metas=metas_list,
+            texts=texts,
+            initial_k=int(initial_k),
+            final_k=int(final_k),
+            per_video_cap=int(per_video_cap),
+        )
+    except Exception as e:
+        with st.chat_message("assistant"):
+            st.error("Search failed.")
+            st.exception(e)
+        st.stop()
 
 # Answer
 with st.chat_message("assistant"):
@@ -352,7 +407,7 @@ with st.chat_message("assistant"):
     with st.spinner("Synthesizing answer…"):
         try:
             answer = openai_answer(
-                st.session_state.get("model_choice", model_choice),
+                st.session_state.get("model_choice", "gpt-4o-mini"),
                 prompt,
                 st.session_state.messages,
                 hits,
