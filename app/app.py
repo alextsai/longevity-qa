@@ -5,16 +5,14 @@ from pathlib import Path
 import os, sys, json, pickle
 from typing import List, Tuple, Dict, Any
 
+# ---- harden runtime, keep CPU+lower memory ----
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
 import streamlit as st
 import numpy as np
 import faiss
 from openai import OpenAI
-
-# -----------------------------------------------------------------------------
-# Environment guards (keep memory/CPU sane on Render)
-# -----------------------------------------------------------------------------
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 # -----------------------------------------------------------------------------
 # Paths / imports
@@ -23,13 +21,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# All data lives under DATA_DIR (Render persistent disk defaults to /var/data)
+# All data lives under DATA_DIR (your Render disk is mounted at /var/data)
 DATA_ROOT = Path(os.getenv("DATA_DIR", "/var/data")).resolve()
 
-from utils.labels import label_and_url  # uses data/catalog/video_meta.json
+from utils.labels import label_and_url  # reads data/catalog/video_meta.json
 
 # -----------------------------------------------------------------------------
-# Constants: where files are expected (under DATA_ROOT)
+# Constants under DATA_ROOT
 # -----------------------------------------------------------------------------
 CHUNKS_PATH     = DATA_ROOT / "data/chunks/chunks.jsonl"
 INDEX_PATH      = DATA_ROOT / "data/index/faiss.index"
@@ -57,7 +55,7 @@ def _parse_ts(v) -> float:
     return 0.0
 
 # -----------------------------------------------------------------------------
-# Data loaders (cached)
+# Cached loaders
 # -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_video_meta() -> Dict[str, Dict[str, str]]:
@@ -105,18 +103,14 @@ def load_chunks_aligned() -> Tuple[List[str], List[dict]]:
             if txt:
                 texts.append(txt)
                 metas.append(m)
-
     return texts, metas
 
 @st.cache_resource(show_spinner=False)
-def get_embedder(model_name: str):
-    """Cached SBERT loader (CPU-only and single-threaded tokenizers)."""
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(model_name)
-
-@st.cache_resource(show_spinner=False)
 def load_index_and_model():
-    """Load FAISS index + metas payload, then build the embedder matching the index."""
+    """
+    Load FAISS and the sentence-transformers encoder (CPU).
+    The encoder name is stored in metas.pkl["model"].
+    """
     if not INDEX_PATH.exists() or not METAS_PKL.exists():
         return None, None, None
 
@@ -124,11 +118,15 @@ def load_index_and_model():
     with METAS_PKL.open("rb") as f:
         payload = pickle.load(f)
 
-    metas_from_pkl = payload.get("metas", [])
+    metas = payload.get("metas", [])
     model_name = payload.get("model", "sentence-transformers/all-MiniLM-L6-v2")
-    embedder = get_embedder(model_name)
 
-    return index, metas_from_pkl, {"model_name": model_name, "embedder": embedder}
+    # Import here so Streamlit can cache this resource correctly.
+    from sentence_transformers import SentenceTransformer
+
+    # Force CPU; normalize later, smaller memory hotpath
+    embedder = SentenceTransformer(model_name, device="cpu")
+    return index, metas, {"model_name": model_name, "embedder": embedder}
 
 # -----------------------------------------------------------------------------
 # Retrieval
@@ -136,7 +134,7 @@ def load_index_and_model():
 def search_chunks(
     query: str,
     index: faiss.Index,
-    embedder,
+    embedder,  # SentenceTransformer
     metas: List[dict],
     texts: List[str],
     initial_k: int,
@@ -185,7 +183,7 @@ def search_chunks(
 def openai_answer(model_name: str, question: str, history: List[Dict[str, str]], hits: List[Dict[str, Any]]) -> str:
     key = os.getenv("OPENAI_API_KEY")
     if not key:
-        return "⚠️ OPENAI_API_KEY is not set. Export it and try again."
+        return "⚠️ OPENAI_API_KEY is not set in the environment."
 
     # Keep last ~6 turns for conversational context
     recent = history[-6:]
@@ -221,7 +219,7 @@ def openai_answer(model_name: str, question: str, history: List[Dict[str, str]],
     )
 
     try:
-        client = OpenAI(timeout=60)
+        client = OpenAI(timeout=30)
         r = client.chat.completions.create(
             model=model_name,
             temperature=0.2,
@@ -246,9 +244,10 @@ with st.sidebar:
         "You can adjust them anytime — the defaults work well for most questions."
     )
 
-    initial_k = st.number_input("Initial candidates (FAISS)", min_value=20, max_value=2000, value=320, step=20)
-    final_k = st.number_input("Final evidence chunks", min_value=5, max_value=200, value=80, step=5)
-    per_video_cap = st.number_input("Max chunks per video", min_value=1, max_value=50, value=12, step=1)
+    # Smaller defaults to reduce memory
+    initial_k = st.number_input("Initial candidates (FAISS)", min_value=20, max_value=2000, value=200, step=20)
+    final_k = st.number_input("Final evidence chunks", min_value=5, max_value=200, value=60, step=5)
+    per_video_cap = st.number_input("Max chunks per video", min_value=1, max_value=50, value=10, step=1)
 
     st.subheader("OpenAI model")
     model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"], index=0)
@@ -286,7 +285,7 @@ st.title("Longevity / Nutrition Q&A")
 
 # Chat history
 if "messages" not in st.session_state:
-    st.session_state.messages = []  # list of {"role":"user"/"assistant", "content": str}
+    st.session_state.messages = []
 
 # Render history
 for m in st.session_state.messages:
@@ -302,7 +301,7 @@ st.session_state.messages.append({"role": "user", "content": prompt})
 with st.chat_message("user"):
     st.markdown(prompt)
 
-# Hard guardrails on required files before loading anything heavy
+# Hard guardrails on missing files (before loading heavy stuff)
 missing_bits = []
 if not INDEX_PATH.exists():
     missing_bits.append("index/faiss.index")
@@ -316,16 +315,21 @@ if not VIDEO_META_JSON.exists():
 if missing_bits:
     with st.chat_message("assistant"):
         st.error(
-            "Required files are missing under DATA_DIR. Missing: "
-            + ", ".join(missing_bits)
-            + "\n\nEnsure they exist under "
-            + f"{DATA_ROOT}/data/..."
+            "Required files were not found in DATA_DIR. Please copy them to your persistent disk and redeploy.\n\n"
+            + "\n".join(f"- {b}" for b in missing_bits)
+            + f"\n\nExpected under: {DATA_ROOT}/data/…"
         )
     st.stop()
 
-# Load resources
-index, metas_from_pkl, payload = load_index_and_model()
-texts, metas = load_chunks_aligned()
+# Load index+encoder and chunks
+try:
+    index, metas_from_pkl, payload = load_index_and_model()
+    texts, metas = load_chunks_aligned()
+except Exception as e:
+    with st.chat_message("assistant"):
+        st.error("Failed to load index or encoder.")
+        st.exception(e)
+    st.stop()
 
 if index is None or payload is None or not texts:
     with st.chat_message("assistant"):
@@ -350,7 +354,7 @@ with st.spinner("Searching sources…"):
         )
     except Exception as e:
         with st.chat_message("assistant"):
-            st.error("Search failed (embedding or FAISS). See details below.")
+            st.error("Search failed.")
             st.exception(e)
         st.stop()
 
@@ -372,18 +376,18 @@ with st.chat_message("assistant"):
                 hits,
             )
         except Exception as e:
-            st.error("OpenAI request failed. See error details below.")
+            st.error("OpenAI request failed.")
             st.exception(e)
             raise
 
-    if not answer or answer.startswith("⚠️"):
-        st.error("The model failed to produce an answer:")
-        st.code(answer or "(empty)", language="text")
+    if not answer.strip() or answer.startswith("⚠️"):
+        st.error("Answer generation returned an error or empty text:")
+        st.code(answer or "<empty>")
     else:
         st.markdown(answer)
         st.session_state.messages.append({"role": "assistant", "content": answer})
 
-    # Sources (collapsed by default)
+    # Collapsed by default
     with st.expander("Sources & timestamps", expanded=False):
         for i, h in enumerate(hits, 1):
             lbl, url = label_and_url(h["meta"])
