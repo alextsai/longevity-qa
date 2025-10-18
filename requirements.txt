@@ -1,17 +1,8 @@
-# Streamlit + deps
 streamlit==1.38.0
-
-# OpenAI Python SDK (your code uses the 1.x client style)
 openai>=1.43,<2
-
-# Embeddings stack
 sentence-transformers==3.0.1
-torch==2.3.1          # CPU wheel installs fine on Render
+torch==2.3.1
 faiss-cpu==1.8.0.post2
-
-# Numpy pinned for faiss/ST compat
 numpy>=1.24,<2
-
-# Utilities
 tqdm>=4.66
 webvtt-py>=0.4
