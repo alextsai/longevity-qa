@@ -1,3 +1,0 @@
-[server]
-enableXsrfProtection = true
-# Do not set enableCORS here. Default is true and compatible.
