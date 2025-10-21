@@ -8,12 +8,12 @@ warnings.filterwarnings("ignore", category=SyntaxWarning)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")         # CPU only
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")           # CPU only
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_MAX_THREADS", "1")
 DATA_ROOT_ENV = os.getenv("DATA_DIR", "/var/data")
-# local cache dirs (works even if HF is rate-limited)
+# Local model cache to avoid Hugging Face 429s
 os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", f"{DATA_ROOT_ENV}/models")
 os.environ.setdefault("HF_HOME", f"{DATA_ROOT_ENV}/models")
 
@@ -43,7 +43,7 @@ if str(ROOT) not in sys.path:
 
 DATA_ROOT = Path(DATA_ROOT_ENV).resolve()
 
-# local helper for nice labels/URLs
+# helper to render labels + URLs for sources
 from utils.labels import label_and_url
 
 CHUNKS_PATH     = DATA_ROOT / "data/chunks/chunks.jsonl"
@@ -52,6 +52,7 @@ METAS_PKL       = DATA_ROOT / "data/index/metas.pkl"
 VIDEO_META_JSON = DATA_ROOT / "data/catalog/video_meta.json"
 REQUIRED = [INDEX_PATH, METAS_PKL, CHUNKS_PATH, VIDEO_META_JSON]
 
+# ---------- Small utilities ----------
 def _parse_ts(v) -> float:
     if isinstance(v, (int, float)):
         try: return float(v)
@@ -64,6 +65,12 @@ def _parse_ts(v) -> float:
             return sec
         except: return 0.0
     return 0.0
+
+def _has_openai_key() -> bool:
+    try:
+        return bool(os.getenv("OPENAI_API_KEY") or getattr(st, "secrets", {}).get("OPENAI_API_KEY"))
+    except Exception:
+        return False
 
 # ---------- Cached loaders ----------
 @st.cache_resource(show_spinner=False)
@@ -96,31 +103,40 @@ def load_chunks_aligned() -> Tuple[List[str], List[dict]]:
 def load_index_and_model():
     """
     Loads FAISS, metas, and the embedder.
-    Embedder first tries local path /var/data/models/all-MiniLM-L6-v2 to avoid HF 429s.
+    Tries local model folder /var/data/models/all-MiniLM-L6-v2 first (no internet needed).
     """
     if not INDEX_PATH.exists() or not METAS_PKL.exists():
         return None, None, None
 
     index = faiss.read_index(str(INDEX_PATH))
+
     with METAS_PKL.open("rb") as f:
         payload = pickle.load(f)
     model_name = payload.get("model", "sentence-transformers/all-MiniLM-L6-v2")
 
-    # Prefer local model cache; fallback to HF repo id
+    # Prefer local cache to avoid HF rate limits
     local_dir = Path(DATA_ROOT) / "models" / "all-MiniLM-L6-v2"
     model_path = str(local_dir) if local_dir.exists() else model_name
-    embedder = SentenceTransformer(model_path, device="cpu")
+
+    try:
+        embedder = SentenceTransformer(model_path, device="cpu")
+    except Exception as e:
+        # Show a clear message if HF blocked the download
+        raise RuntimeError(
+            f"Failed to load encoder '{model_path}'. "
+            f"If this is a HF 429 issue, cache the model to {local_dir} and restart. Original error: {e}"
+        )
 
     return index, payload.get("metas", []), {"model_name": model_name, "embedder": embedder}
 
-# ---------- MMR (hard-capped) ----------
+# ---------- MMR re-rank with caps ----------
 def mmr_rerank_lite(q_emb: np.ndarray,
                     cand_embs: np.ndarray,
                     hits: List[Dict[str, Any]],
                     final_k: int,
                     per_video_cap: int,
                     lam: float = 0.4) -> List[Dict[str, Any]]:
-    pool = min(len(hits), max(int(final_k) * 2, 40), 80)  # <= 80 to cap RAM
+    pool = min(len(hits), max(int(final_k) * 2, 40), 80)  # hard cap to protect RAM
     cand_embs = cand_embs[:pool]
     hits = hits[:pool]
     if pool == 0: return []
@@ -199,7 +215,7 @@ def search_chunks(query: str,
         embs = embedder.encode(cand_texts, normalize_embeddings=True, batch_size=16).astype("float32")
     return mmr_rerank_lite(q, embs, raw[:pool], int(final_k), int(per_video_cap), float(lambda_diversity))
 
-# ---------- OpenAI (compact + retries) ----------
+# ---------- OpenAI answer synthesis ----------
 def openai_answer(model_name: str, question: str, history, hits) -> str:
     key = os.getenv("OPENAI_API_KEY") or (st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None)
     if not key:
@@ -221,38 +237,33 @@ def openai_answer(model_name: str, question: str, history, hits) -> str:
         ev.append(f"[{i}] {lbl}\n{txt}\n")
 
     system = (
-        "Answer ONLY from the excerpts. Use short quoted phrases followed by [n] citations. "
-        "If evidence is insufficient, say you don't know. Be concise."
+        "You must answer ONLY from the provided excerpts. "
+        "Use short quoted phrases and cite with [n]. If unsure, say you don't know."
     )
     convo = ("\n".join(f"{'User' if m['role']=='user' else 'Assistant'}: {m['content']}" for m in ctx_msgs) + "\n\n") if ctx_msgs else ""
     user_payload = (
         f"{('Recent conversation:\n' + convo) if convo else ''}"
         f"Question: {question}\n\nExcerpts:\n" + "\n".join(ev) +
-        "\nWrite the best possible answer consistent with the excerpts. Quote fragments and cite like [n]."
+        "\nWrite a concise, practical answer. Quote fragments and cite like [n]."
     )
 
     client = OpenAI(timeout=30, max_retries=3)
-    for attempt in range(3):
-        try:
-            r = client.chat.completions.create(
-                model=model_name,
-                temperature=0.2,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_payload},
-                ],
-                timeout=30,
-            )
-            return (r.choices[0].message.content or "").strip()
-        except Exception as e:
-            err = str(e)
-            if attempt < 2 and ("502" in err or "timeout" in err.lower() or "Bad gateway" in err):
-                import time; time.sleep(1.5 * (attempt + 1)); continue
-            return f"⚠️ OpenAI error: {err}"
+    try:
+        r = client.chat.completions.create(
+            model=model_name,
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_payload},
+            ],
+            timeout=30,
+        )
+        return (r.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"⚠️ OpenAI error: {e}"
 
 def openai_ping(model_name: str) -> str:
-    key = os.getenv("OPENAI_API_KEY") or (st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None)
-    if not key: return "NO_KEY"
+    if not _has_openai_key(): return "NO_KEY"
     try:
         client = OpenAI(timeout=15, max_retries=2)
         r = client.chat.completions.create(model=model_name, temperature=0,
@@ -267,40 +278,62 @@ st.title("Longevity / Nutrition Q&A")
 
 with st.sidebar:
     st.header("Settings")
-    st.markdown("Tune retrieval and synthesis. Defaults are safe for small CPU instances.")
 
+    st.markdown(
+        "These controls change **how much is searched** and **how much evidence** is sent to the AI. "
+        "If the app restarts or shows errors, use the defaults."
+    )
+
+    # User inputs with clear, non-technical help
     initial_k = st.number_input(
         "Candidate chunks searched",
         min_value=20, max_value=2000, value=64, step=16,
-        help="How many FAISS hits to pull before re-ranking. Higher = more recall, more RAM/CPU."
+        help=(
+            "How much we search before filtering. Higher finds more possibilities but uses more memory and time. "
+            "Start at 64 on small servers. Increase slowly if answers seem thin."
+        ),
     )
     final_k = st.number_input(
         "Evidence chunks kept",
         min_value=5, max_value=120, value=30, step=5,
-        help="Chunks sent to the model as evidence. Balance recall vs cost/latency."
+        help=(
+            "How many excerpts are sent to the AI as proof. Higher gives more context but costs more and can slow down. "
+            "30–40 is a good balance. Use 50–60 only on larger servers."
+        ),
     )
     per_video_cap = st.number_input(
         "Max chunks per video",
         min_value=1, max_value=30, value=5, step=1,
-        help="Cap per source so one video cannot dominate the evidence."
+        help=(
+            "Prevents one video from dominating the answer. "
+            "Raise if you want deeper detail from a single source."
+        ),
     )
     use_mmr = st.toggle(
-        "Use MMR re-rank (pool ≤ 80)",
+        "Use diversity boost (MMR)",
         value=False,
-        help="Diversifies evidence with a hard pool/batch cap to protect memory."
+        help=(
+            "Spreads evidence across different videos to avoid duplicates. "
+            "Slightly more memory. Turn off if the server is tight on RAM."
+        ),
     )
     lambda_div = st.slider(
-        "Diversity (MMR λ)",
+        "Diversity strength",
         min_value=0.0, max_value=1.0, value=0.4, step=0.05,
-        help="0 = more novelty, 1 = more query similarity. 0.3–0.5 works well."
+        help="0 = more variety, 1 = stick closest to the query. 0.3–0.5 works well.",
     )
 
     st.subheader("Model")
-    model_choice = st.selectbox("OpenAI model", ["gpt-4o-mini","gpt-4o"], index=0)
+    model_choice = st.selectbox(
+        "OpenAI model",
+        ["gpt-4o-mini","gpt-4o"],
+        index=0,
+        help="Use gpt-4o-mini for speed and cost. Switch to gpt-4o for slightly better writing."
+    )
     st.session_state["model_choice"] = model_choice
 
     st.divider()
-    st.subheader("Index status (DATA_DIR)")
+    st.subheader("Index status (under DATA_DIR)")
     st.caption(f"DATA_DIR = `{DATA_ROOT}`")
     st.checkbox("data/chunks/chunks.jsonl", value=CHUNKS_PATH.exists(), disabled=True)
     st.checkbox("data/index/faiss.index", value=INDEX_PATH.exists(), disabled=True)
@@ -310,7 +343,7 @@ with st.sidebar:
     texts_cache, metas_cache = load_chunks_aligned()
     st.markdown(f"**Chunks indexed:** {len(texts_cache):,}")
 
-    # Primary sources: by videos per channel
+    # Primary sources by unique videos per channel
     vm = load_video_meta()
     chan_to_vids: Dict[str, set] = {}
     for m in metas_cache:
@@ -320,10 +353,9 @@ with st.sidebar:
         chan_to_vids.setdefault(ch, set()).add(vid)
     if chan_to_vids:
         st.subheader("Primary sources (videos per channel)")
-        top = sorted(((ch, len(vs)) for ch, vs in chan_to_vids.items()), key=lambda x: x[1], reverse=True)[:6]
-        for ch, vcount in top:
-            q = ch.replace(" ", "+"); url = f"https://www.youtube.com/results?search_query={q}"
-            st.markdown(f"- [{ch}]({url}) — {vcount:,} videos")
+        for ch, vcount in sorted(((c, len(vs)) for c, vs in chan_to_vids.items()), key=lambda x: x[1], reverse=True)[:6]:
+            q = ch.replace(" ", "+")
+            st.markdown(f"- [{ch}](https://www.youtube.com/results?search_query={q}) — {vcount:,} videos")
 
     st.divider()
     with st.expander("Health checks", expanded=False):
@@ -335,9 +367,9 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Alignment check failed: {e}")
         st.code(f"OpenAI ping: {openai_ping(model_choice)}", language="bash")
-        st.caption("Expect 'pong'. If ERR/NO_KEY appears, fix OPENAI_API_KEY/network or model choice.")
+        st.caption("Expect 'pong'. If ERR/NO_KEY shows, fix OPENAI_API_KEY or network.")
 
-# ---------- Chat ----------
+# ---------- Chat history ----------
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -345,10 +377,18 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
+# ---------- Input ----------
 prompt = st.chat_input("Ask about sleep, protein timing, fasting, supplements, protocols…")
 if prompt is None:
     st.stop()
 
+# ---------- Hard caps to prevent OOM (server-side guard) ----------
+initial_k = min(int(initial_k), 96)
+final_k   = min(int(final_k), 40)
+per_video_cap = min(int(per_video_cap), 8)
+use_mmr = bool(use_mmr) and (final_k <= 40)
+
+# Show user message
 st.session_state.messages.append({"role": "user", "content": prompt})
 with st.chat_message("user"):
     st.markdown(prompt)
@@ -357,16 +397,19 @@ with st.chat_message("user"):
 missing = [p.relative_to(DATA_ROOT) for p in REQUIRED if not p.exists()]
 if missing:
     with st.chat_message("assistant"):
-        st.error("Required files missing under DATA_DIR:\n" + "\n".join(f"- {DATA_ROOT / p}" for p in missing))
+        st.error(
+            "Required files are missing under DATA_DIR.\n" +
+            "\n".join(f"- {DATA_ROOT / p}" for p in missing)
+        )
     st.stop()
 
-# ---------- Load artifacts ----------
+# ---------- Load artifacts only when needed ----------
 try:
     index, metas_from_pkl, payload = load_index_and_model()
     texts, metas = load_chunks_aligned()
 except Exception as e:
     with st.chat_message("assistant"):
-        st.error("Failed to load FAISS/chunks.")
+        st.error("Failed to load index or data.")
         st.exception(e)
     st.stop()
 
@@ -375,10 +418,10 @@ if index is None or payload is None or not texts:
         st.error("Index/metas/chunks not found or empty.")
     st.stop()
 
-# Alignment hard checks
+# Alignment checks
 if int(index.ntotal) != len(texts):
     with st.chat_message("assistant"):
-        st.error(f"Index mismatch. FAISS ntotal={int(index.ntotal):,} vs chunks={len(texts):,}. Rebuild index.")
+        st.error(f"Index mismatch. FAISS ntotal={int(index.ntotal):,} vs chunks={len(texts):,}. Rebuild the index.")
     st.stop()
 if metas_from_pkl is not None and len(metas_from_pkl) != len(texts):
     with st.chat_message("assistant"):
@@ -411,7 +454,7 @@ with st.spinner("Searching sources…"):
 # ---------- Answer ----------
 with st.chat_message("assistant"):
     if not hits:
-        st.warning("No sources found. Try broadening the query.")
+        st.warning("No sources found. Try simpler wording or widen the search in the sidebar.")
         st.session_state.messages.append({"role": "assistant", "content": "No matching excerpts were found."})
         st.stop()
 
@@ -422,7 +465,12 @@ with st.chat_message("assistant"):
             st.caption(h["text"])
 
     with st.spinner("Synthesizing answer…"):
-        answer = openai_answer(st.session_state.get("model_choice", model_choice), prompt, st.session_state.messages, hits)
+        answer = openai_answer(
+            st.session_state.get("model_choice", model_choice),
+            prompt,
+            st.session_state.messages,
+            hits,
+        )
 
     st.markdown(answer)
     st.session_state.messages.append({"role": "assistant", "content": answer})
@@ -431,4 +479,4 @@ with st.chat_message("assistant"):
         for i, h in enumerate(hits, 1):
             lbl, url = label_and_url(h["meta"])
             st.markdown(f"{i}. [{lbl}]({url})" if url else f"{i}. {lbl}")
-        st.caption("Quoted spans in the answer cite these sources as [n].")
+        st.caption("Quoted phrases in the answer cite these sources as [n].")
