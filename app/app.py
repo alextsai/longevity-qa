@@ -1,110 +1,165 @@
 # app/app.py
 # -*- coding: utf-8 -*-
+
 from __future__ import annotations
 
-# ---------- Low-memory + offline-friendly runtime knobs (set before imports) ----------
-import os, warnings
-warnings.filterwarnings("ignore", category=SyntaxWarning)
+# ------------------ Minimal, safe env ------------------
+import os
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")           # CPU only
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_MAX_THREADS", "1")
-DATA_ROOT_ENV = os.getenv("DATA_DIR", "/var/data")
-# Local model cache to avoid Hugging Face 429s
-os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", f"{DATA_ROOT_ENV}/models")
-os.environ.setdefault("HF_HOME", f"{DATA_ROOT_ENV}/models")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")  # CPU only
 
-# ---------- Standard imports ----------
+# ------------------ Standard imports -------------------
 from pathlib import Path
-import sys, json, pickle
+import sys
+import json
+import pickle
 from typing import List, Tuple, Dict, Any
-from contextlib import nullcontext
+import math
+import time
+import re
 
 import streamlit as st
 import numpy as np
 import faiss
 
-try:
-    import torch
-    torch.set_num_threads(1)
-except Exception:
-    torch = None
-
-from openai import OpenAI
+# Model
 from sentence_transformers import SentenceTransformer
 
-# ---------- Paths / helpers ----------
+# OpenAI
+from openai import OpenAI
+
+# Optional web fetch (kept resilient; app still runs without)
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except Exception:
+    requests = None
+    BeautifulSoup = None
+
+# ---------------------------------------------------------------------
+# Paths / setup
+# ---------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-DATA_ROOT = Path(DATA_ROOT_ENV).resolve()
+DATA_ROOT = Path(os.getenv("DATA_DIR", "/var/data")).resolve()
 
-# helper to render labels + URLs for sources
-from utils.labels import label_and_url
+# Local label helper
+try:
+    from utils.labels import label_and_url
+except Exception:
+    # Fallback if helper missing
+    def label_and_url(meta: dict) -> Tuple[str, str]:
+        vid = meta.get("video_id") or "Unknown"
+        start = meta.get("start", 0)
+        ts = int(start)
+        return (f"{vid} @ {ts}s", "")
 
+# Required files
 CHUNKS_PATH     = DATA_ROOT / "data/chunks/chunks.jsonl"
+OFFSETS_NPY     = DATA_ROOT / "data/chunks/chunks.offsets.npy"  # created by bootstrap
 INDEX_PATH      = DATA_ROOT / "data/index/faiss.index"
 METAS_PKL       = DATA_ROOT / "data/index/metas.pkl"
 VIDEO_META_JSON = DATA_ROOT / "data/catalog/video_meta.json"
+
 REQUIRED = [INDEX_PATH, METAS_PKL, CHUNKS_PATH, VIDEO_META_JSON]
 
-# ---------- Small utilities ----------
+# ---------------------------------------------------------------------
+# Trusted web domains
+# ---------------------------------------------------------------------
+TRUSTED_DOMAINS = [
+    "nih.gov",
+    "medlineplus.gov",
+    "cdc.gov",
+    "mayoclinic.org",
+    "health.harvard.edu",
+    "familydoctor.org",
+    "healthfinder.gov",
+    # AMA list is a PDF index; still allow:
+    "ama-assn.org",
+    "medicalxpress.com",
+    "sciencedaily.com",
+    "nejm.org",
+    "med.stanford.edu",
+    "icahn.mssm.edu",
+]
+
+# ---------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------
 def _parse_ts(v) -> float:
     if isinstance(v, (int, float)):
         try: return float(v)
-        except: return 0.0
+        except Exception: return 0.0
     if isinstance(v, str):
+        parts = v.split(":")
         try:
             sec = 0.0
-            for p in v.split(":"):
+            for p in parts:
                 sec = sec * 60 + float(p)
             return sec
-        except: return 0.0
+        except Exception:
+            return 0.0
     return 0.0
 
-def _has_openai_key() -> bool:
-    try:
-        return bool(os.getenv("OPENAI_API_KEY") or getattr(st, "secrets", {}).get("OPENAI_API_KEY"))
-    except Exception:
-        return False
+def _normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
-# ---------- Cached loaders ----------
+# ---------------------------------------------------------------------
+# Zero-copy chunk reader (RAM-safe)
+# ---------------------------------------------------------------------
+def _ensure_offsets() -> np.ndarray:
+    if OFFSETS_NPY.exists():
+        try:
+            return np.load(OFFSETS_NPY)
+        except Exception:
+            pass
+    # build offsets lazily if missing
+    pos = 0
+    offs = []
+    with CHUNKS_PATH.open("rb") as f:
+        for ln in f:
+            offs.append(pos)
+            pos += len(ln)
+    arr = np.array(offs, dtype=np.int64)
+    OFFSETS_NPY.parent.mkdir(parents=True, exist_ok=True)
+    np.save(OFFSETS_NPY, arr)
+    return arr
+
+def iter_jsonl_rows(indices: List[int], limit: int | None = None):
+    """Yield rows by file offsets without loading entire file."""
+    if not CHUNKS_PATH.exists():
+        return
+    offsets = _ensure_offsets()
+    want = [i for i in indices if 0 <= i < len(offsets)]
+    if limit is not None:
+        want = want[:limit]
+    with CHUNKS_PATH.open("rb") as f:
+        for i in want:
+            f.seek(int(offsets[i]))
+            raw = f.readline()
+            try:
+                j = json.loads(raw)
+                yield i, j
+            except Exception:
+                continue
+
+# ---------------------------------------------------------------------
+# Cached loaders
+# ---------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_video_meta() -> Dict[str, Dict[str, str]]:
-    if not VIDEO_META_JSON.exists(): return {}
-    try: return json.loads(VIDEO_META_JSON.read_text(encoding="utf-8"))
-    except Exception: return {}
+    if VIDEO_META_JSON.exists():
+        try: return json.loads(VIDEO_META_JSON.read_text(encoding="utf-8"))
+        except Exception: return {}
+    return {}
 
 @st.cache_resource(show_spinner=False)
-def load_chunks_aligned() -> Tuple[List[str], List[dict]]:
-    texts, metas = [], []
-    if not CHUNKS_PATH.exists(): return texts, metas
-    with CHUNKS_PATH.open(encoding="utf-8") as f:
-        for line in f:
-            try: j = json.loads(line)
-            except Exception: continue
-            t = (j.get("text") or "").strip()
-            m = (j.get("meta") or {}).copy()
-            vid = (
-                m.get("video_id") or m.get("vid") or m.get("ytid") or
-                j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id")
-            )
-            if vid: m["video_id"] = vid
-            if "start" not in m and "start_sec" in m: m["start"] = m["start_sec"]
-            m["start"] = _parse_ts(m.get("start", 0))
-            if t: texts.append(t); metas.append(m)
-    return texts, metas
-
-@st.cache_resource(show_spinner=False)
-def load_index_and_model():
-    """
-    Loads FAISS, metas, and the embedder.
-    Tries local model folder /var/data/models/all-MiniLM-L6-v2 first (no internet needed).
-    """
+def load_metas_and_model():
+    """Load FAISS, metas, and a CPU embedder. Avoid HF network if model is local."""
     if not INDEX_PATH.exists() or not METAS_PKL.exists():
         return None, None, None
 
@@ -112,143 +167,228 @@ def load_index_and_model():
 
     with METAS_PKL.open("rb") as f:
         payload = pickle.load(f)
+    metas_from_pkl = payload.get("metas", [])
     model_name = payload.get("model", "sentence-transformers/all-MiniLM-L6-v2")
 
-    # Prefer local cache to avoid HF rate limits
-    local_dir = Path(DATA_ROOT) / "models" / "all-MiniLM-L6-v2"
-    model_path = str(local_dir) if local_dir.exists() else model_name
+    # Prefer local cached model if present
+    local_dir = DATA_ROOT / "models" / "all-MiniLM-L6-v2"
+    try_name = str(local_dir) if (local_dir / "config.json").exists() else model_name
 
-    try:
-        embedder = SentenceTransformer(model_path, device="cpu")
-    except Exception as e:
-        # Show a clear message if HF blocked the download
-        raise RuntimeError(
-            f"Failed to load encoder '{model_path}'. "
-            f"If this is a HF 429 issue, cache the model to {local_dir} and restart. Original error: {e}"
+    embedder = SentenceTransformer(try_name, device="cpu")
+    return index, metas_from_pkl, {"model_name": try_name, "embedder": embedder}
+
+# ---------------------------------------------------------------------
+# Retrieval + MMR re-rank
+# ---------------------------------------------------------------------
+def mmr(query_vec: np.ndarray, doc_vecs: np.ndarray, k: int, lambda_diversity: float = 0.4):
+    """
+    Maximal Marginal Relevance.
+    query_vec: (d,)
+    doc_vecs: (N, d) normalized
+    returns list of selected indices
+    """
+    if doc_vecs.size == 0:
+        return []
+    sim_to_query = (doc_vecs @ query_vec.reshape(-1, 1)).ravel()  # cosine (normalized)
+    selected = []
+    candidates = set(range(doc_vecs.shape[0]))
+    while candidates and len(selected) < k:
+        if not selected:
+            i = int(np.argmax(sim_to_query[list(candidates)]))
+            pick = list(candidates)[i]
+            selected.append(pick)
+            candidates.remove(pick)
+            continue
+        # diversity term = max sim to any already selected
+        selected_vecs = doc_vecs[selected]
+        div = selected_vecs @ doc_vecs[list(candidates)].T  # (len(sel), |cand|)
+        max_div = div.max(axis=0)
+        cand_list = list(candidates)
+        scores = lambda_diversity * sim_to_query[cand_list] - (1 - lambda_diversity) * max_div
+        pick = cand_list[int(np.argmax(scores))]
+        selected.append(pick)
+        candidates.remove(pick)
+    return selected
+
+def search_chunks(
+    query: str,
+    index: faiss.Index,
+    embedder: SentenceTransformer,
+    initial_k: int,
+    final_k: int,
+    per_video_cap: int,
+    apply_mmr: bool,
+    mmr_lambda: float,
+) -> List[Dict[str, Any]]:
+    if not query.strip():
+        return []
+
+    # Encode query normalized
+    qv = embedder.encode([query], normalize_embeddings=True).astype("float32")[0]
+
+    # First-pass FAISS search
+    K = min(int(initial_k), index.ntotal if index is not None else initial_k)
+    D, I = index.search(qv.reshape(1, -1), K)
+    indices = [int(x) for x in I[0] if x >= 0]
+    scores0 = [float(s) for s in D[0][:len(indices)]]
+
+    # Read candidate rows without loading entire file
+    raw_rows: List[Tuple[int, dict]] = list(iter_jsonl_rows(indices))
+    texts: List[str] = []
+    metas: List[dict] = []
+    for _, j in raw_rows:
+        txt = _normalize_text(j.get("text", ""))
+        m = (j.get("meta") or {}).copy()
+        vid = (
+            m.get("video_id")
+            or m.get("vid")
+            or m.get("ytid")
+            or j.get("video_id")
+            or j.get("vid")
+            or j.get("ytid")
+            or j.get("id")
         )
+        if vid:
+            m["video_id"] = vid
+        if "start" not in m and "start_sec" in m:
+            m["start"] = m.get("start_sec")
+        m["start"] = _parse_ts(m.get("start", 0))
+        if txt:
+            texts.append(txt)
+            metas.append(m)
 
-    return index, payload.get("metas", []), {"model_name": model_name, "embedder": embedder}
+    if not texts:
+        return []
 
-# ---------- MMR re-rank with caps ----------
-def mmr_rerank_lite(q_emb: np.ndarray,
-                    cand_embs: np.ndarray,
-                    hits: List[Dict[str, Any]],
-                    final_k: int,
-                    per_video_cap: int,
-                    lam: float = 0.4) -> List[Dict[str, Any]]:
-    pool = min(len(hits), max(int(final_k) * 2, 40), 80)  # hard cap to protect RAM
-    cand_embs = cand_embs[:pool]
-    hits = hits[:pool]
-    if pool == 0: return []
+    # Embed candidate texts lightweight for re-rank (same encoder)
+    doc_vecs = embedder.encode(texts, normalize_embeddings=True, batch_size=64).astype("float32")
 
-    sim_q = cand_embs @ q_emb
-    sims  = cand_embs @ cand_embs.T
+    # Optional MMR diversity
+    order = list(range(len(texts)))
+    if apply_mmr:
+        sel = mmr(qv, doc_vecs, k=min(len(texts), max(8, final_k * 2)), lambda_diversity=float(mmr_lambda))
+        order = sel
 
-    selected, counts = [], {}
-    seed = int(np.argmax(sim_q))
-    v = hits[seed]["meta"].get("video_id") or "unknown"
-    selected.append(seed); counts[v] = 1
-    remaining = set(range(pool)); remaining.discard(seed)
+    # Pack hits with original scores (for tie-breaks)
+    hits: List[Dict[str, Any]] = []
+    for idx_in_order in order:
+        i_global = indices[idx_in_order] if idx_in_order < len(indices) else None
+        score = scores0[idx_in_order] if idx_in_order < len(scores0) else 0.0
+        hits.append({"i": i_global, "score": float(score), "text": texts[idx_in_order], "meta": metas[idx_in_order]})
 
-    while len(selected) < final_k and remaining:
-        best, bestscore = None, -1e9
-        for i in list(remaining):
-            vid = hits[i]["meta"].get("video_id") or "unknown"
-            if counts.get(vid, 0) >= per_video_cap:
-                remaining.discard(i); continue
-            max_sim = float(np.max(sims[i, selected])) if selected else 0.0
-            score = lam * sim_q[i] - (1.0 - lam) * max_sim
-            if score > bestscore: bestscore, best = score, i
-        if best is None: break
-        selected.append(best); remaining.discard(best)
-        vid = hits[best]["meta"].get("video_id") or "unknown"
-        counts[vid] = counts.get(vid, 0) + 1
+    # Cap per-video and trim to final_k
+    seen_per_video: Dict[str, int] = {}
+    out: List[Dict[str, Any]] = []
+    cap = max(1, int(per_video_cap))
+    for h in hits:
+        vid = h["meta"].get("video_id", "Unknown")
+        seen_per_video[vid] = seen_per_video.get(vid, 0) + 1
+        if seen_per_video[vid] <= cap:
+            out.append(h)
+        if len(out) >= int(final_k):
+            break
 
-    return [hits[i] for i in selected]
+    return out
 
-# ---------- Retrieval ----------
-def search_chunks(query: str,
-                  index: faiss.Index,
-                  embedder: SentenceTransformer,
-                  metas: List[dict],
-                  texts: List[str],
-                  initial_k: int,
-                  final_k: int,
-                  per_video_cap: int,
-                  use_mmr: bool,
-                  lambda_diversity: float) -> List[Dict[str, Any]]:
-    if not query.strip(): return []
+# ---------------------------------------------------------------------
+# Trusted web fetch (simple and safe)
+# ---------------------------------------------------------------------
+def fetch_trusted_snippets(query: str, max_snippets: int = 4, per_domain: int = 1, timeout: float = 6.0) -> List[Dict[str, str]]:
+    """
+    Very lightweight site-constrained fetch using DuckDuckGo HTML.
+    Returns [{domain, url, text}], truncated. Skips if requests/bs4 absent.
+    """
+    if not requests or not BeautifulSoup:
+        return []
 
-    ctx = torch.no_grad() if torch is not None else nullcontext()
-    with ctx:
-        q = embedder.encode([query], normalize_embeddings=True).astype("float32")[0]
+    headers = {"User-Agent": "Mozilla/5.0"}
+    snippets: List[Dict[str, str]] = []
+    for domain in TRUSTED_DOMAINS:
+        try:
+            q = f"site:{domain} {query}"
+            resp = requests.get("https://duckduckgo.com/html/", params={"q": q}, headers=headers, timeout=timeout)
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.text, "html.parser")
+            links = []
+            for a in soup.select("a.result__a"):
+                href = a.get("href")
+                if href and domain in href:
+                    links.append(href)
+            links = links[:per_domain]
+            for url in links:
+                try:
+                    r2 = requests.get(url, headers=headers, timeout=timeout)
+                    if r2.status_code != 200:
+                        continue
+                    s2 = BeautifulSoup(r2.text, "html.parser")
+                    # simple paragraph harvest
+                    paras = [p.get_text(" ", strip=True) for p in s2.find_all("p")]
+                    text = _normalize_text(" ".join(paras))[:1500]
+                    if len(text) < 200:
+                        continue
+                    snippets.append({"domain": domain, "url": url, "text": text})
+                except Exception:
+                    continue
+            if len(snippets) >= max_snippets:
+                break
+        except Exception:
+            continue
+    return snippets[:max_snippets]
 
-    K = max(1, min(int(initial_k), int(index.ntotal)))
-    D, I = index.search(q.reshape(1, -1), K)
-    idxs, scores = I[0].tolist(), D[0].tolist()
-
-    raw: List[Dict[str, Any]] = []
-    for i, s in zip(idxs, scores):
-        if 0 <= i < len(texts):
-            m = metas[i] if i < len(metas) else {}
-            if not m.get("video_id"):
-                vid = m.get("vid") or m.get("ytid")
-                if vid: m["video_id"] = vid
-            m["start"] = _parse_ts(m.get("start", 0))
-            raw.append({"i": i, "score": float(s), "text": texts[i], "meta": m})
-
-    if not raw: return []
-
-    if not use_mmr:
-        out, counts = [], {}
-        for h in raw:
-            vid = h["meta"].get("video_id") or "unknown"
-            counts[vid] = counts.get(vid, 0) + 1
-            if counts[vid] <= per_video_cap:
-                out.append(h)
-            if len(out) >= final_k: break
-        return out
-
-    pool = min(len(raw), max(int(final_k) * 2, 40), 80)
-    cand_texts = [h["text"] for h in raw[:pool]]
-    with (torch.no_grad() if torch is not None else nullcontext()):
-        embs = embedder.encode(cand_texts, normalize_embeddings=True, batch_size=16).astype("float32")
-    return mmr_rerank_lite(q, embs, raw[:pool], int(final_k), int(per_video_cap), float(lambda_diversity))
-
-# ---------- OpenAI answer synthesis ----------
-def openai_answer(model_name: str, question: str, history, hits) -> str:
-    key = os.getenv("OPENAI_API_KEY") or (st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None)
+# ---------------------------------------------------------------------
+# Answer synthesis (OpenAI)
+# ---------------------------------------------------------------------
+def openai_answer(model_name: str, question: str, history: List[Dict[str, str]], hits: List[Dict[str, Any]], web_snips: List[Dict[str, str]]) -> str:
+    key = os.getenv("OPENAI_API_KEY")
     if not key:
-        return "⚠️ OPENAI_API_KEY is not set."
+        return "⚠️ OPENAI_API_KEY is not set. Add it in your hosting environment."
 
-    # keep ≤3 prior turns
-    ctx_msgs = []
-    for m in reversed(history[:-1]):
-        if m.get("role") in ("user", "assistant") and m.get("content"):
-            ctx_msgs.append(m)
-        if len(ctx_msgs) >= 3: break
-    ctx_msgs = list(reversed(ctx_msgs))
+    # Keep last ~6 turns for light context
+    recent = history[-6:]
+    convo: List[str] = []
+    for m in recent:
+        role = m.get("role")
+        content = m.get("content", "")
+        if role in ("user", "assistant") and content:
+            label = "User" if role == "user" else "Assistant"
+            convo.append(f"{label}: {content}")
 
-    ev = []
+    # Build evidence block from video chunks
+    lines: List[str] = []
     for i, h in enumerate(hits, 1):
         lbl, _ = label_and_url(h["meta"])
-        txt = (h["text"] or "")
-        if len(txt) > 280: txt = txt[:280]
-        ev.append(f"[{i}] {lbl}\n{txt}\n")
+        # Include a short quoted span for grounding
+        span = h["text"][:300]
+        lines.append(f"[{i}] {lbl}\n“{span}”\n")
+
+    # Add trusted web snippets if any
+    web_lines: List[str] = []
+    for j, s in enumerate(web_snips, 1):
+        web_lines.append(f"(W{j}) {s['domain']} — {s['url']}\n“{s['text'][:300]}”\n")
 
     system = (
-        "You must answer ONLY from the provided excerpts. "
-        "Use short quoted phrases and cite with [n]. If unsure, say you don't know."
-    )
-    convo = ("\n".join(f"{'User' if m['role']=='user' else 'Assistant'}: {m['content']}" for m in ctx_msgs) + "\n\n") if ctx_msgs else ""
-    user_payload = (
-        f"{('Recent conversation:\n' + convo) if convo else ''}"
-        f"Question: {question}\n\nExcerpts:\n" + "\n".join(ev) +
-        "\nWrite a concise, practical answer. Quote fragments and cite like [n]."
+        "You answer ONLY with the provided evidence. Prioritize video excerpts, then trusted web snippets.\n"
+        "Rules:\n"
+        "• Do not invent facts. If uncertain, say you don't know.\n"
+        "• Provide a concise, structured answer:\n"
+        "  - Key takeaways\n"
+        "  - Practical protocol or steps\n"
+        "  - Safety notes and when to consult a clinician\n"
+        "  - Sources cited inline in prose, like (Video 2) or (CDC W1)\n"
+        "• Avoid medical diagnosis. Offer general guidance only."
     )
 
-    client = OpenAI(timeout=30, max_retries=3)
+    user_payload = (
+        (("Recent conversation:\n" + "\n".join(convo) + "\n\n") if convo else "")
+        + f"Question: {question}\n\n"
+        + "Video Excerpts:\n" + ("\n".join(lines) if lines else "None\n")
+        + ("\nTrusted Web Snippets:\n" + "\n".join(web_lines) if web_lines else "\nTrusted Web Snippets: None\n")
+        + "\nWrite the best possible answer fully consistent with this evidence."
+    )
+
     try:
+        client = OpenAI(timeout=45)
         r = client.chat.completions.create(
             model=model_name,
             temperature=0.2,
@@ -256,23 +396,14 @@ def openai_answer(model_name: str, question: str, history, hits) -> str:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_payload},
             ],
-            timeout=30,
         )
         return (r.choices[0].message.content or "").strip()
     except Exception as e:
-        return f"⚠️ OpenAI error: {e}"
+        return f"⚠️ Generation error: {e}"
 
-def openai_ping(model_name: str) -> str:
-    if not _has_openai_key(): return "NO_KEY"
-    try:
-        client = OpenAI(timeout=15, max_retries=2)
-        r = client.chat.completions.create(model=model_name, temperature=0,
-                                           messages=[{"role":"user","content":"Return 'pong'."}], timeout=15)
-        return (r.choices[0].message.content or "").strip()
-    except Exception as e:
-        return f"ERR:{e}"
-
-# ---------- UI ----------
+# ---------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------
 st.set_page_config(page_title="Longevity / Nutrition Q&A", page_icon="🍎", layout="wide")
 st.title("Longevity / Nutrition Q&A")
 
@@ -280,170 +411,173 @@ with st.sidebar:
     st.header("Settings")
 
     st.markdown(
-        "These controls change **how much is searched** and **how much evidence** is sent to the AI. "
-        "If the app restarts or shows errors, use the defaults."
+        "Tune how the system searches your library and builds answers. "
+        "Defaults are safe for most questions."
     )
 
-    # User inputs with clear, non-technical help
+    # Retrieval knobs with tooltips
     initial_k = st.number_input(
         "Candidate chunks searched",
-        min_value=20, max_value=2000, value=64, step=16,
-        help=(
-            "How much we search before filtering. Higher finds more possibilities but uses more memory and time. "
-            "Start at 64 on small servers. Increase slowly if answers seem thin."
-        ),
+        min_value=32, max_value=2000, value=128, step=32,
+        help="How many top matches we pull from the index before re-ranking. Higher finds more but is slower."
     )
     final_k = st.number_input(
         "Evidence chunks kept",
-        min_value=5, max_value=120, value=30, step=5,
-        help=(
-            "How many excerpts are sent to the AI as proof. Higher gives more context but costs more and can slow down. "
-            "30–40 is a good balance. Use 50–60 only on larger servers."
-        ),
+        min_value=10, max_value=120, value=40, step=5,
+        help="How many of the best chunks we keep to build your answer. Too high can dilute relevance."
     )
     per_video_cap = st.number_input(
         "Max chunks per video",
-        min_value=1, max_value=30, value=5, step=1,
-        help=(
-            "Prevents one video from dominating the answer. "
-            "Raise if you want deeper detail from a single source."
-        ),
-    )
-    use_mmr = st.toggle(
-        "Use diversity boost (MMR)",
-        value=False,
-        help=(
-            "Spreads evidence across different videos to avoid duplicates. "
-            "Slightly more memory. Turn off if the server is tight on RAM."
-        ),
-    )
-    lambda_div = st.slider(
-        "Diversity strength",
-        min_value=0.0, max_value=1.0, value=0.4, step=0.05,
-        help="0 = more variety, 1 = stick closest to the query. 0.3–0.5 works well.",
+        min_value=1, max_value=20, value=6, step=1,
+        help="Prevents one video from dominating. Keeps results diverse across sources."
     )
 
-    st.subheader("Model")
-    model_choice = st.selectbox(
-        "OpenAI model",
-        ["gpt-4o-mini","gpt-4o"],
-        index=0,
-        help="Use gpt-4o-mini for speed and cost. Switch to gpt-4o for slightly better writing."
+    st.subheader("Diversity boost")
+    use_mmr = st.checkbox(
+        "Use diversity (MMR)",
+        value=True,
+        help="Encourages variety among sources while staying relevant. Good for broader questions."
     )
-    st.session_state["model_choice"] = model_choice
+    mmr_lambda = st.slider(
+        "MMR balance",
+        min_value=0.1, max_value=0.9, value=0.4, step=0.05,
+        help="Higher = more relevance, lower = more diversity in selected chunks."
+    )
+
+    st.subheader("OpenAI model")
+    model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"], index=0)
+
+    st.subheader("Trusted web boost")
+    include_web = st.checkbox(
+        "Include trusted web sources",
+        value=False,
+        help="Adds brief evidence from NIH, CDC, Mayo Clinic, NEJM, Stanford Medicine, and similar sites."
+    )
+    max_web = st.slider(
+        "Max web snippets",
+        min_value=0, max_value=8, value=3, step=1,
+        help="Upper bound on web excerpts merged into the answer."
+    )
 
     st.divider()
-    st.subheader("Index status (under DATA_DIR)")
+    st.subheader("Index status")
     st.caption(f"DATA_DIR = `{DATA_ROOT}`")
     st.checkbox("data/chunks/chunks.jsonl", value=CHUNKS_PATH.exists(), disabled=True)
+    st.checkbox("data/chunks/chunks.offsets.npy", value=OFFSETS_NPY.exists(), disabled=True)
     st.checkbox("data/index/faiss.index", value=INDEX_PATH.exists(), disabled=True)
     st.checkbox("data/index/metas.pkl", value=METAS_PKL.exists(), disabled=True)
     st.checkbox("data/catalog/video_meta.json", value=VIDEO_META_JSON.exists(), disabled=True)
 
-    texts_cache, metas_cache = load_chunks_aligned()
-    st.markdown(f"**Chunks indexed:** {len(texts_cache):,}")
-
-    # Primary sources by unique videos per channel
+    # Primary sources summary
     vm = load_video_meta()
-    chan_to_vids: Dict[str, set] = {}
-    for m in metas_cache:
-        vid = m.get("video_id")
-        if not vid: continue
-        ch = (vm.get(vid, {}).get("channel") or m.get("channel") or m.get("uploader") or "").strip() or "Unknown"
-        chan_to_vids.setdefault(ch, set()).add(vid)
-    if chan_to_vids:
-        st.subheader("Primary sources (videos per channel)")
-        for ch, vcount in sorted(((c, len(vs)) for c, vs in chan_to_vids.items()), key=lambda x: x[1], reverse=True)[:6]:
-            q = ch.replace(" ", "+")
-            st.markdown(f"- [{ch}](https://www.youtube.com/results?search_query={q}) — {vcount:,} videos")
+    # count videos per channel
+    counts: Dict[str, int] = {}
+    for vid, info in vm.items():
+        ch = (info.get("channel") or "").strip() or "Unknown"
+        counts[ch] = counts.get(ch, 0) + 1
+    if counts:
+        st.subheader("Primary sources")
+        st.caption("Channels with most videos indexed")
+        for ch, cnt in sorted(counts.items(), key=lambda x: x[1], reverse=True)[:6]:
+            url = ""
+            # try to link to channel url if present in meta (optional)
+            if isinstance(vm, dict):
+                # find any video with this channel that has a url
+                for _vid, _info in vm.items():
+                    if (_info.get("channel") or "").strip() == ch:
+                        url = _info.get("url", "")
+                        break
+            if url:
+                st.markdown(f"- [{ch}]({url}) — **{cnt} videos**")
+            else:
+                st.markdown(f"- **{ch}** — **{cnt} videos**")
 
+    # Health / debug
     st.divider()
     with st.expander("Health checks", expanded=False):
+        ok = all(p.exists() for p in REQUIRED)
+        st.write(f"Files present: {ok}")
+        # show alignment counts if possible
         try:
-            ix = faiss.read_index(str(INDEX_PATH)) if INDEX_PATH.exists() else None
-            metas_len = len(pickle.load(open(METAS_PKL,"rb"))["metas"]) if METAS_PKL.exists() else 0
-            lines = sum(1 for _ in open(CHUNKS_PATH,encoding="utf-8")) if CHUNKS_PATH.exists() else 0
-            st.code(f"ntotal={getattr(ix,'ntotal',0)}, metas={metas_len}, chunks_lines={lines}", language="bash")
+            ix = faiss.read_index(str(INDEX_PATH))
+            with METAS_PKL.open("rb") as f:
+                mp = pickle.load(f)
+            metas_n = len(mp.get("metas", []))
+            offsets = _ensure_offsets()
+            st.write(f"faiss.ntotal = {ix.ntotal:,}")
+            st.write(f"metas = {metas_n:,}")
+            st.write(f"chunks.lines = {len(offsets):,}")
+            st.write("aligned =", ix.ntotal == metas_n == len(offsets))
         except Exception as e:
-            st.error(f"Alignment check failed: {e}")
-        st.code(f"OpenAI ping: {openai_ping(model_choice)}", language="bash")
-        st.caption("Expect 'pong'. If ERR/NO_KEY shows, fix OPENAI_API_KEY or network.")
+            st.write(f"alignment check error: {e}")
 
-# ---------- Chat history ----------
+        # OpenAI ping
+        try:
+            if os.getenv("OPENAI_API_KEY"):
+                client = OpenAI(timeout=10)
+                ping = client.chat.completions.create(model=model_choice, messages=[{"role": "user", "content": "ping"}])
+                st.write("OpenAI ping:", "ok" if ping.choices else "err")
+            else:
+                st.write("OpenAI ping: NO_KEY")
+        except Exception as e:
+            st.write(f"OpenAI ping error: {e}")
+
+# Chat state
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# Render history
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# ---------- Input ----------
 prompt = st.chat_input("Ask about sleep, protein timing, fasting, supplements, protocols…")
 if prompt is None:
     st.stop()
-
-# ---------- Hard caps to prevent OOM (server-side guard) ----------
-initial_k = min(int(initial_k), 96)
-final_k   = min(int(final_k), 40)
-per_video_cap = min(int(per_video_cap), 8)
-use_mmr = bool(use_mmr) and (final_k <= 40)
 
 # Show user message
 st.session_state.messages.append({"role": "user", "content": prompt})
 with st.chat_message("user"):
     st.markdown(prompt)
 
-# ---------- Required files guard ----------
-missing = [p.relative_to(DATA_ROOT) for p in REQUIRED if not p.exists()]
+# Hard guardrails
+missing = [p for p in REQUIRED if not p.exists()]
 if missing:
     with st.chat_message("assistant"):
         st.error(
-            "Required files are missing under DATA_DIR.\n" +
-            "\n".join(f"- {DATA_ROOT / p}" for p in missing)
+            "Required files were not found. The service’s bootstrap must place these under DATA_DIR.\n\n"
+            + "\n".join(f"- {p}" for p in missing)
         )
     st.stop()
 
-# ---------- Load artifacts only when needed ----------
+# Load index + model
 try:
-    index, metas_from_pkl, payload = load_index_and_model()
-    texts, metas = load_chunks_aligned()
+    index, metas_from_pkl, payload = load_metas_and_model()
 except Exception as e:
     with st.chat_message("assistant"):
-        st.error("Failed to load index or data.")
+        st.error("Failed to load FAISS index or embedder.")
         st.exception(e)
     st.stop()
 
-if index is None or payload is None or not texts:
+if index is None or payload is None:
     with st.chat_message("assistant"):
-        st.error("Index/metas/chunks not found or empty.")
-    st.stop()
-
-# Alignment checks
-if int(index.ntotal) != len(texts):
-    with st.chat_message("assistant"):
-        st.error(f"Index mismatch. FAISS ntotal={int(index.ntotal):,} vs chunks={len(texts):,}. Rebuild the index.")
-    st.stop()
-if metas_from_pkl is not None and len(metas_from_pkl) != len(texts):
-    with st.chat_message("assistant"):
-        st.error("metas.pkl length mismatch. Rebuild artifacts together.")
+        st.error("Index or model not available.")
     st.stop()
 
 embedder: SentenceTransformer = payload["embedder"]
 
-# ---------- Retrieval ----------
-with st.spinner("Searching sources…"):
+# Retrieval
+with st.spinner("Searching library…"):
     try:
         hits = search_chunks(
             prompt,
             index=index,
             embedder=embedder,
-            metas=metas,
-            texts=texts,
             initial_k=int(initial_k),
             final_k=int(final_k),
             per_video_cap=int(per_video_cap),
-            use_mmr=bool(use_mmr),
-            lambda_diversity=float(lambda_div),
+            apply_mmr=bool(use_mmr),
+            mmr_lambda=float(mmr_lambda),
         )
     except Exception as e:
         with st.chat_message("assistant"):
@@ -451,32 +585,45 @@ with st.spinner("Searching sources…"):
             st.exception(e)
         st.stop()
 
-# ---------- Answer ----------
+# Optional trusted web augmentation
+web_snips: List[Dict[str, str]] = []
+if include_web:
+    with st.spinner("Fetching trusted web sources…"):
+        try:
+            web_snips = fetch_trusted_snippets(prompt, max_snippets=int(max_web))
+        except Exception:
+            web_snips = []
+
+# Answer
 with st.chat_message("assistant"):
-    if not hits:
-        st.warning("No sources found. Try simpler wording or widen the search in the sidebar.")
-        st.session_state.messages.append({"role": "assistant", "content": "No matching excerpts were found."})
+    if not hits and not web_snips:
+        st.warning("No evidence found. Try a simpler phrasing or broaden the topic.")
+        st.session_state.messages.append(
+            {"role": "assistant", "content": "I couldn’t find sufficient evidence to answer that."}
+        )
         st.stop()
 
-    with st.expander("Top matches (raw excerpts)", expanded=False):
-        for i, h in enumerate(hits[:3], 1):
-            lbl, url = label_and_url(h["meta"])
-            st.markdown(f"**{i}. {lbl}** — score {h['score']:.3f}")
-            st.caption(h["text"])
-
-    with st.spinner("Synthesizing answer…"):
+    with st.spinner("Synthesizing…"):
         answer = openai_answer(
-            st.session_state.get("model_choice", model_choice),
+            model_choice,
             prompt,
             st.session_state.messages,
             hits,
+            web_snips,
         )
 
     st.markdown(answer)
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
+    # Sources
     with st.expander("Sources & timestamps", expanded=False):
+        # Video sources
         for i, h in enumerate(hits, 1):
             lbl, url = label_and_url(h["meta"])
             st.markdown(f"{i}. [{lbl}]({url})" if url else f"{i}. {lbl}")
-        st.caption("Quoted phrases in the answer cite these sources as [n].")
+        # Web sources
+        if web_snips:
+            st.markdown("**Trusted web sources**")
+            for j, s in enumerate(web_snips, 1):
+                st.markdown(f"W{j}. [{s['domain']}]({s['url']})")
+        st.caption("Answers synthesize video excerpts and optionally trusted web snippets. If evidence is weak, I’ll say so.")
