@@ -1,459 +1,400 @@
-"""
-Longevity / Nutrition Q&A — Streamlit app
------------------------------------------
+# app/app.py
+# Streamlit UI for “Longevity / Nutrition Q&A”
+# - Uses FAISS + JSONL chunks in /var/data
+# - If video centroids exist, does video-first narrowing with the SAME embedder
+#   used to build the FAISS index. This fixes the dim mismatch assert.
+# - Left panel is simplified and non-technical. All controls are safe.
+# - Works without optional files; shows status clearly.
 
-WHAT THIS FILE DOES
-- Defines the UI and retrieval workflow.
-- Loads your FAISS + metas + chunks under DATA_DIR (default /var/data).
-- If precomputed per-video centroids exist (produced at boot by scripts/bootstrap_data.py),
-  uses them to pre-filter the candidate videos (fast + low memory).
-- Groups sources by video in the “Sources” panel.
-- Fixes two issues you saw:
-    1) set_page_config is now the *first* Streamlit call (Streamlit requirement).
-    2) Avoids printing list-of-DeltaGenerators by not using list-comprehensions for st.code.
+from __future__ import annotations
 
-You can read the big “HOW IT WORKS” block near the top for a quick mental model.
-"""
-
-# ---------------------------------------------------------------------------
-# 0) STREAMLIT MUST BE CONFIGURED BEFORE ANY WIDGETS ARE CREATED
-# ---------------------------------------------------------------------------
-import streamlit as st
-
-st.set_page_config(
-    page_title="Longevity / Nutrition Q&A",
-    page_icon="🍎",
-    layout="wide"
-)
-
-# ---------------------------------------------------------------------------
-# 1) IMPORTS AND GLOBAL SWITCHES
-# ---------------------------------------------------------------------------
-# Silence the noisy torch.classes warning you saw in the logs.
-import warnings
-warnings.filterwarnings("ignore", message="Examining the path of torch.classes")
-
-import os
-import json
-import time
-import math
-import pickle
-import itertools
+import os, json, pickle, math, time
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import Dict, List, Iterable, Tuple, Optional
+from collections import defaultdict, Counter
 
 import numpy as np
-import faiss  # CPU FAISS (installed by requirements.txt)
-from sentence_transformers import SentenceTransformer
+import streamlit as st
+import faiss
 
-# If you use OpenAI for synthesis, import it here.
-# (leave it optional; retrieval-only still works if no key is present)
-try:
-    import openai
-    OPENAI_AVAILABLE = True
-except Exception:
-    OPENAI_AVAILABLE = False
+# ── 0) Page config must be FIRST Streamlit call ────────────────────────────────
+st.set_page_config(page_title="Longevity / Nutrition Q&A", page_icon="🍎", layout="wide")
 
-
-# ---------------------------------------------------------------------------
-# 2) CONFIG / DATA LAYOUT
-# ---------------------------------------------------------------------------
-"""
-HOW IT WORKS
-
-DATA_DIR (default /var/data) is a volume. Inside it we expect:
-
-/data/index/faiss.index          — FAISS index for all chunk embeddings
-/data/index/metas.pkl            — dict with "metas": list per-chunk metadata
-/data/chunks/chunks.jsonl        — 1 JSON object per line: {"text": ..., "meta": {...}}
-/data/catalog/video_meta.json    — catalog of videos (id, title, channel, etc)
-
-OPTIONAL (auto-built at boot by scripts/bootstrap_data.py):
-/data/index/video_centroids.npy  — float32 matrix [Nvideos, d] = mean embedding per video
-/data/index/video_ids.txt        — text file with one video_id per line
-/data/catalog/video_summaries.json — lightweight title map for display (optional)
-
-This app will:
-- Load the FAISS index + metas + chunks lazily.
-- If the video centroids exist, use them to preselect a small set of **videos** for
-  deeper chunk search (this is the “max depth first, then breadth” behavior you wanted).
-- Keep memory low by never loading all chunk texts at once (stream iterating chunks.jsonl).
-"""
-
+# ── 1) Constants & paths ───────────────────────────────────────────────────────
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data")).resolve()
-INDEX_DIR = DATA_DIR / "data" / "index"
-CHUNKS_DIR = DATA_DIR / "data" / "chunks"
-CATALOG_DIR = DATA_DIR / "data" / "catalog"
+IDX_DIR  = DATA_DIR / "data" / "index"
+CHUNK_FP = DATA_DIR / "data" / "chunks" / "chunks.jsonl"
+META_FP  = DATA_DIR / "data" / "catalog" / "video_meta.json"  # optional catalog for titles/channels
 
-FAISS_PATH  = INDEX_DIR / "faiss.index"
-METAS_PATH  = INDEX_DIR / "metas.pkl"
-CHUNKS_PATH = CHUNKS_DIR / "chunks.jsonl"
-CATALOG_PATH = CATALOG_DIR / "video_meta.json"
+# Optional precomputes
+VID_IDS_FP   = IDX_DIR / "video_ids.txt"
+VID_CENT_FP  = IDX_DIR / "video_centroids.npy"
+VID_SUM_FP   = DATA_DIR / "data" / "catalog" / "video_summaries.json"  # optional lightweight title map
 
-# Optional, used when present
-VID_CENTROIDS_PATH = INDEX_DIR / "video_centroids.npy"
-VID_IDS_PATH       = INDEX_DIR / "video_ids.txt"
-VID_SUMMARIES_PATH = CATALOG_DIR / "video_summaries.json"
+# ── 2) Cached loaders ──────────────────────────────────────────────────────────
+@st.cache_resource
+def load_metas_and_model_name():
+    """Load metas.pkl to discover the FAISS embed model used for chunks."""
+    mp = pickle.load(open(IDX_DIR / "metas.pkl", "rb"))
+    model_name = mp.get("model", "sentence-transformers/all-MiniLM-L6-v2")
+    return mp, model_name
 
-# Model name comes from the index metadata. Fallback to MiniLM if missing.
-DEFAULT_ENCODER = "sentence-transformers/all-MiniLM-L6-v2"
-
-# Reusable cache for heavy objects
-@st.cache_resource(show_spinner=False)
-def _load_index_and_metas():
-    ix = faiss.read_index(str(FAISS_PATH))
-    mp = pickle.load(open(METAS_PATH, "rb"))
-    model_name = mp.get("model", DEFAULT_ENCODER)
-    return ix, mp, model_name
-
-@st.cache_resource(show_spinner=False)
-def _load_encoder(model_name: str):
-    # Allow the model to resolve from local cache under /var/data/models as well
-    # (bootstrap_data may have snapshot_download'ed it there).
-    local_cache = str(DATA_DIR / "models")
-    os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", local_cache)
-    os.environ.setdefault("HF_HOME", local_cache)
-    return SentenceTransformer(model_name, device="cpu")
-
-@st.cache_resource(show_spinner=False)
-def _load_video_centroids():
-    if VID_CENTROIDS_PATH.exists() and VID_IDS_PATH.exists():
-        mat = np.load(VID_CENTROIDS_PATH)
-        ids = [ln.strip() for ln in open(VID_IDS_PATH, encoding="utf-8")]
-        return mat.astype("float32", copy=False), ids
-    return None, None
-
-@st.cache_resource(show_spinner=False)
-def _load_catalog():
-    if CATALOG_PATH.exists():
+@st.cache_resource
+def load_retr_embedder(model_name: str):
+    """Load the SAME embedder used to build FAISS index (CPU, local cache first)."""
+    from sentence_transformers import SentenceTransformer
+    local_dir = DATA_DIR / "models" / model_name.split("/")[-1]
+    for p in (str(local_dir), model_name):
         try:
-            return json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+            return SentenceTransformer(p, device="cpu")
         except Exception:
             pass
-    return []
+    raise RuntimeError(f"Could not load retrieval embedder: {model_name}")
 
-@st.cache_resource(show_spinner=False)
-def _load_titles_map():
+@st.cache_resource
+def load_faiss_index():
+    """Load the FAISS index for chunk embeddings."""
+    ix = faiss.read_index(str(IDX_DIR / "faiss.index"))
+    return ix
+
+@st.cache_resource
+def load_centroid_index():
+    """Load per-video centroid matrix and FAISS index over it. Optional."""
+    if not (VID_IDS_FP.exists() and VID_CENT_FP.exists()):
+        return None, None, None
+    video_ids = VID_IDS_FP.read_text().strip().splitlines()
+    C = np.load(VID_CENT_FP).astype("float32")  # [Nvideos, d]
+    d = C.shape[1]
+    faiss.normalize_L2(C)                       # cosine via inner product
+    idx = faiss.IndexFlatIP(d)
+    idx.add(C)
+    return video_ids, C, idx
+
+@st.cache_resource
+def load_title_map() -> Dict[str, Dict[str,str]]:
     """
-    Returns {video_id: title}. Handles both list-of-dicts and dict-of-dicts formats.
+    Returns: {video_id: {"title":..., "channel":...}}
+    Accepts video_summaries.json (optional) or falls back to video_meta.json.
     """
-    # Prefer precomputed summaries
-    if VID_SUMMARIES_PATH.exists():
+    if VID_SUM_FP.exists():
         try:
-            d = json.loads(VID_SUMMARIES_PATH.read_text(encoding="utf-8"))
-            if isinstance(d, dict):
-                # dictionary of {id: {title: ...}} OR {id: title}
-                out = {}
-                for k, v in d.items():
-                    if isinstance(v, dict):
-                        out[k] = v.get("title", "")
-                    else:
-                        out[k] = str(v)
-                return out
-            elif isinstance(d, list):
-                # list of {id:..., title:...}
-                return {str(x.get("video_id") or x.get("id") or ""): x.get("title", "") for x in d}
+            return json.loads(VID_SUM_FP.read_text())
         except Exception:
             pass
+    if META_FP.exists():
+        try:
+            meta = json.loads(META_FP.read_text())
+            out = {}
+            for v in meta:
+                vid = str(v.get("video_id") or v.get("id") or "")
+                if not vid: 
+                    continue
+                out[vid] = {"title": v.get("title",""), "channel": v.get("channel","")}
+            return out
+        except Exception:
+            pass
+    return {}
 
-    # Fallback to catalog (list or dict)
-    cat = _load_catalog()
-    m = {}
-    if isinstance(cat, dict):
-        for k, v in cat.items():
-            if isinstance(v, dict):
-                m[str(k)] = v.get("title", "")
-            else:
-                m[str(k)] = str(v)
-    elif isinstance(cat, list):
-        for row in cat:
-            if not isinstance(row, dict):
-                continue
-            vid = str(row.get("video_id") or row.get("id") or "")
-            if vid:
-                m[vid] = row.get("title") or ""
-    return m
+def _mk_norm(text: str) -> str:
+    return (text or "").strip().lower()
 
-# Minimal, fast JSONL streaming to avoid loading all chunks at once
-def iter_chunks_jsonl(path: Path):
-    with path.open(encoding="utf-8") as f:
+# ── 3) Chunk iterator (zero-copy streaming) ────────────────────────────────────
+def iter_chunks(jsonl_path: Path) -> Iterable[Dict]:
+    """Stream chunks.jsonl safely and cheaply."""
+    with open(jsonl_path, "r", encoding="utf-8") as f:
         for ln in f:
             try:
-                yield json.loads(ln)
+                j = json.loads(ln)
+                t = (j.get("text") or "").strip()
+                m = j.get("meta") or {}
+                if not t:
+                    continue
+                # unify id fields
+                vid = (
+                    m.get("video_id") or j.get("video_id") or m.get("vid") or
+                    m.get("ytid") or j.get("vid") or j.get("ytid") or m.get("id") or j.get("id")
+                )
+                start = m.get("start") or m.get("start_sec") or m.get("ts") or 0
+                yield {"text": t, "video_id": str(vid or ""), "start": float(start), "meta": m}
             except Exception:
                 continue
 
-# ---------------------------------------------------------------------------
-# 3) UTILS — SEARCH
-# ---------------------------------------------------------------------------
-def encode_query(q: str, enc: SentenceTransformer) -> np.ndarray:
-    v = enc.encode([q], normalize_embeddings=True).astype("float32")
-    return v
+# ── 4) Retrieval helpers (video-first then chunk) ─────────────────────────────
+mp, RETR_MODEL_NAME = load_metas_and_model_name()
+retr_embedder = load_retr_embedder(RETR_MODEL_NAME)
+ix = load_faiss_index()
+VIDEO_IDS, CENTROIDS, CENTROID_FAISS = load_centroid_index()
+TITLE_MAP = load_title_map()
 
-def top_videos_by_centroid(query_v: np.ndarray, top_v: int = 8) -> List[str]:
+@st.cache_data(show_spinner=False)
+def _list_all_channels_and_videos() -> Tuple[List[str], Dict[str,List[Tuple[str,str]]]]:
     """
-    If video-level centroids are present, use them to select the most relevant videos first.
-    Returns a list of video_ids (strings).
+    Returns:
+      channels: sorted unique channel names
+      by_channel: {channel: [(video_id, title), ...]}
     """
-    mat, ids = _load_video_centroids()
-    if mat is None:
-        return []  # centroids missing
-    # cosine ~ inner product because embeddings are normalized
-    D, I = faiss.IndexFlatIP(mat.shape[1]).search(query_v @ mat.T, top_v)  # fast but OK
-    picked = []
-    for i in I[0]:
-        if 0 <= i < len(ids):
-            picked.append(ids[i])
-    return picked
+    by_channel = defaultdict(list)
+    # Prefer catalog; if missing, scan chunks.jsonl headers lazily
+    if TITLE_MAP:
+        for vid, rec in TITLE_MAP.items():
+            ch = rec.get("channel","") or "Unknown"
+            by_channel[ch].append((vid, rec.get("title","")))
+    else:
+        seen = set()
+        for row in iter_chunks(CHUNK_FP):
+            vid = row["video_id"]
+            if not vid or vid in seen: 
+                continue
+            seen.add(vid)
+            by_channel["Unknown"].append((vid, ""))
+    channels = sorted(by_channel.keys())
+    for ch in channels:
+        by_channel[ch].sort(key=lambda x: _mk_norm(x[1]))
+    return channels, by_channel
 
-def search_chunks_in_index(query_v: np.ndarray, ix: faiss.Index, top_k: int) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    FAISS search at chunk level.
-    Returns (scores, indices) arrays.
-    """
-    D, I = ix.search(query_v, top_k)
-    return D[0], I[0]
+def top_videos_by_centroid(query_text: str, k: int) -> List[str]:
+    """Use SAME embedder dim as FAISS to avoid asserts. Falls back to []."""
+    if CENTROID_FAISS is None or retr_embedder is None:
+        return []
+    qv = retr_embedder.encode([query_text], normalize_embeddings=True)
+    qv = np.asarray(qv, dtype="float32")      # [1, d] matches centroids dim
+    faiss.normalize_L2(qv)
+    k = max(1, min(k, CENTROID_FAISS.ntotal))
+    D, I = CENTROID_FAISS.search(qv, k)
+    return [VIDEO_IDS[j] for j in I[0] if j >= 0]
 
-def filter_hits_to_videos(indices: np.ndarray,
-                          desired_videos: List[str],
-                          metas: List[dict],
-                          keep: int) -> List[int]:
-    """
-    Keep only hits whose video_id ∈ desired_videos. Preserve order.
-    Stop after 'keep'.
-    """
-    desired = set(desired_videos)
-    out = []
-    for idx in indices:
-        if idx < 0:  # FAISS padding
-            continue
-        m = metas[idx] if 0 <= idx < len(metas) else None
-        vid = None
-        if m:
-            vid = m.get("video_id") or m.get("vid") or m.get("ytid") or m.get("id")
-        if vid and vid in desired:
-            out.append(int(idx))
-        if len(out) >= keep:
-            break
+@st.cache_data(show_spinner=False)
+def _vid_to_rowids() -> Dict[str, List[int]]:
+    """Map video_id -> list of chunk row indices (for quick filtering)."""
+    out = defaultdict(list)
+    # metas.pkl contains "metas": per-chunk meta; we only need video_id location map
+    metas = mp.get("metas", [])
+    for i, m in enumerate(metas):
+        vid = str(m.get("video_id") or m.get("vid") or m.get("id") or "")
+        if vid:
+            out[vid].append(i)
     return out
 
-def gather_chunks_text(indices: List[int], max_per_video: int = 3) -> Dict[str, List[Tuple[int, str]]]:
+VID2ROWIDS = _vid_to_rowids()
+
+def _search_chunks_in_videos(query_text: str, candidate_vids: List[str], k_chunks: int) -> List[Tuple[int, float]]:
     """
-    Read chunks.jsonl ONCE and take the exact chunk texts we need. Group by video_id.
-    Returns dict: {video_id: [(chunk_index, text), ...]}
+    Search within the union of rows for candidate videos, return top k (row_id, score).
     """
-    want = set(indices)
-    grouped: Dict[str, List[Tuple[int, str]]] = {}
-    # one pass over JSONL with a running index
-    i = 0
-    for row in iter_chunks_jsonl(CHUNKS_PATH):
-        if i in want:
-            meta = row.get("meta", {})
-            vid = meta.get("video_id") or meta.get("vid") or meta.get("ytid") or row.get("video_id") or ""
-            if vid:
-                grouped.setdefault(vid, [])
-                if len(grouped[vid]) < max_per_video:
-                    grouped[vid].append((i, (row.get("text") or "").strip()))
-        i += 1
-    return grouped
+    # Build a tiny FAISS index view: use the global index, but restrict ids via IVF? We’ll fetch via subset.
+    # Simple approach: search globally for more than needed, then filter by candidate vids.
+    qv = retr_embedder.encode([query_text], normalize_embeddings=True).astype("float32")
+    faiss.normalize_L2(qv)
+    # Ask for 10x more then filter
+    ask = min(max(k_chunks*10, k_chunks+32), ix.ntotal)
+    D, I = ix.search(qv, ask)
+    good = []
+    cand = set(candidate_vids)
+    metas = mp.get("metas", [])
+    for d, i in zip(D[0], I[0]):
+        if i < 0:
+            continue
+        vid = str(metas[i].get("video_id") or metas[i].get("vid") or metas[i].get("id") or "")
+        if not cand or (vid in cand):
+            good.append((i, float(d)))
+            if len(good) >= k_chunks:
+                break
+    return good
 
-def synthesize_answer(query: str,
-                      grouped_chunks: Dict[str, List[Tuple[int, str]]],
-                      titles_map: Dict[str, str],
-                      model: str = "gpt-4o-mini") -> str:
-    """
-    Very small answer synthesizer. If OPENAI api key not present, returns a retrieval-only
-    stitched summary. If OPENAI is available, we prompt it with 6–10 short evidence snippets.
-    """
-    # build short evidence set
-    snippets = []
-    for vid, pairs in grouped_chunks.items():
-        for _, text in pairs:
-            if not text:
-                continue
-            snippets.append(text[:400])
-    snippets = snippets[:10]
+def _search_chunks_global(query_text: str, k_chunks: int) -> List[Tuple[int, float]]:
+    qv = retr_embedder.encode([query_text], normalize_embeddings=True).astype("float32")
+    faiss.normalize_L2(qv)
+    ask = min(k_chunks, ix.ntotal)
+    D, I = ix.search(qv, ask)
+    return [(int(i), float(d)) for i, d in zip(I[0], D[0]) if i >= 0]
 
-    if not OPENAI_AVAILABLE or not os.getenv("OPENAI_API_KEY"):
-        # fallback: simple stitched summary
-        if not snippets:
-            return "No relevant evidence found in the selected sources."
-        joined = " • ".join(snippets)
-        return f"Evidence-based notes (retrieval-only): {joined}"
-
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-    sys_prompt = (
-        "You are a careful health assistant. Answer the user strictly from the provided evidence. "
-        "Write short, clear steps and call out safety flags. Do not invent citations."
-    )
-    user_msg = f"QUESTION:\n{query}\n\nEVIDENCE SNIPPETS:\n" + "\n\n".join(f"- {s}" for s in snippets)
-
-    # OpenAI Chat Completions API (compatible with gpt-4o-mini)
-    resp = openai.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_msg},
-        ],
-        temperature=0.2,
-        max_tokens=600,
-    )
-    return resp.choices[0].message.content.strip()
-
-
-# ---------------------------------------------------------------------------
-# 4) SIDEBAR — SETTINGS + DATA STATUS
-# ---------------------------------------------------------------------------
+# ── 5) UI: Left panel (simple, descriptive) ───────────────────────────────────
 with st.sidebar:
-    st.header("Settings")
+    st.markdown("### Settings")
     st.caption(
-        "These controls change **how much we search** and **how much evidence** is sent to the AI. "
-        "Defaults are safe. If the app restarts or shows errors, reset to defaults."
+        "These options change *how much* the app searches and how much evidence is shown. "
+        "They are safe; reset to defaults if you see errors."
     )
-
-    # Main knobs
     videos_to_consider = st.number_input(
         "Videos to consider before chunk search",
-        min_value=1, max_value=50, value=8, step=1,
-        help="When video centroids are available, we first rank videos by similarity to your question and only search chunks within the top N videos."
+        min_value=1, max_value=100, value=8, step=1,
+        help="When available, the app first finds a few likely videos using fast similarity. "
+             "Then it searches chunks in those videos for precise answers."
     )
     candidate_chunks = st.number_input(
         "Candidate chunks searched",
-        min_value=16, max_value=512, value=96, step=16,
-        help="How many chunk candidates to pull from the FAISS index before filtering to videos."
+        min_value=16, max_value=512, value=96, step=8,
+        help="Upper bound on chunks evaluated for the answer."
     )
     evidence_kept = st.number_input(
         "Evidence chunks kept",
-        min_value=3, max_value=60, value=30, step=1,
-        help="How many chunk texts to send into the answer step. Fewer = faster, More = potentially richer."
+        min_value=1, max_value=50, value=30, step=1,
+        help="How many chunks are returned as evidence for the final answer."
     )
     max_chunks_per_video = st.number_input(
         "Max chunks per video",
         min_value=1, max_value=10, value=3, step=1,
-        help="Cap per-source so one video cannot dominate the answer."
+        help="Limit chunks from any single video to keep the answer balanced."
     )
 
-    st.divider()
-    st.subheader("Data status (under DATA_DIR)")
-    base = DATA_DIR
-    need = [CHUNKS_PATH, FAISS_PATH, METAS_PATH, CATALOG_PATH]
-    missing = [p for p in need if not p.exists()]
+    # Source picking (channels and optional specific videos)
+    st.markdown("### Pick sources to include")
+    channels, by_channel = _list_all_channels_and_videos()
+    default_channels = channels  # include all by default
+    chosen_channels = st.multiselect(
+        "Channels to include",
+        channels, default_channels,
+        help="Only use videos from these channels."
+    )
 
-    # Clear, friendly status
-    if missing:
-        st.error("Required files are missing under DATA_DIR:")
-        for p in missing:
-            st.code(str(p))
-    else:
+    # Conditionally allow picking specific videos
+    all_vid_options = []
+    for ch in chosen_channels:
+        all_vid_options.extend([(f"{title or 'Untitled'} — {ch}", vid) for vid, title in by_channel.get(ch, [])])
+    st.caption("Optional: pick specific videos (otherwise all from chosen channels).")
+    chosen_video_label = st.selectbox(
+        "Choose a video (optional)", ["<All videos>"] + [lbl for (lbl, _vid) in all_vid_options],
+        index=0
+    )
+    chosen_video_ids = set()
+    if chosen_video_label != "<All videos>":
+        # map label -> id
+        lbl2id = {lbl: vid for (lbl, vid) in all_vid_options}
+        chosen_video_ids = {lbl2id[chosen_video_label]}
+
+    # Trusted websites toggle (stubs for future live fetching)
+    st.markdown("### Trusted websites")
+    use_web = st.checkbox("Add short excerpts from trusted health sites", value=False)
+    trusted_sites = st.multiselect(
+        "Sites to include",
+        ["nih.gov","medlineplus.gov","cdc.gov","mayoclinic.org","health.harvard.edu",
+         "familydoctor.org","healthfinder.gov","nejm.org","stanford.edu","mountsinai.org",
+         "medicalxpress.com","sciencedaily.com/health-medicine"],
+        default=[]
+    )
+
+    # Data status
+    st.markdown("### Data status (under DATA_DIR)")
+    core_ok = CHUNK_FP.exists() and (IDX_DIR / "faiss.index").exists() and (IDX_DIR / "metas.pkl").exists()
+    if core_ok:
         st.success("Core files found.")
+    else:
+        st.error("Required files are missing. Check your volume mount and bootstrap logs.")
 
-    # Optional files
-    have_centroids = VID_CENTROIDS_PATH.exists() and VID_IDS_PATH.exists()
-    if have_centroids:
+    if VID_CENT_FP.exists() and VID_IDS_FP.exists():
         st.info("Per-video centroids found — video-first search is enabled.")
     else:
         st.warning("Video centroids not found. The app will search chunks directly (still works).")
 
-    # Small debug peek (fixed: no more DeltaGenerator dump)
     st.caption("Debug peek: first 3 expected paths")
-    peek_paths = [str(p) for p in need[:3]]
-    for p in peek_paths:
-        st.code(p)
+    for p in [CHUNK_FP, IDX_DIR / "faiss.index", IDX_DIR / "metas.pkl"]:
+        st.code(str(p), language="bash")
 
-
-# ---------------------------------------------------------------------------
-# 5) MAIN — APP BODY
-# ---------------------------------------------------------------------------
-st.title("Longevity / Nutrition Q&A")
-
-# If core files are missing, do not proceed.
-if missing:
-    st.stop()
-
-# Load heavy artifacts once
-ix, metas_map, model_name = _load_index_and_metas()
-metas: List[dict] = metas_map.get("metas", [])
-enc = _load_encoder(model_name)
-titles_map = _load_titles_map()
-
-# Input
-question = st.chat_input(
-    placeholder="Ask about sleep, protein timing, fasting, supplements, protocols…"
+# ── 6) Main area ───────────────────────────────────────────────────────────────
+st.markdown("## Longevity / Nutrition Q&A")
+query = st.text_input(
+    "Ask about sleep, protein timing, fasting, supplements, protocols…",
+    help="Ask one clear question. The app returns a concise answer with citations."
 )
 
-# When there is no question yet, show a friendly empty state
-if not question:
-    st.write("Ask a question to see evidence-based suggestions.")
-    st.stop()
+if query and core_ok:
+    try:
+        t0 = time.time()
 
-# ---------------------------------------------------------------------------
-# 6) RETRIEVAL PIPELINE
-# ---------------------------------------------------------------------------
-t0 = time.time()
+        # Source restriction set
+        allowed_vids = set()
+        for ch in chosen_channels:
+            for vid, _title in by_channel.get(ch, []):
+                allowed_vids.add(vid)
+        if chosen_video_ids:
+            allowed_vids &= chosen_video_ids
 
-# 6.1 encode the query
-qv = encode_query(question, enc)  # shape (1, d)
+        # 1) Video-first narrowing if centroids exist
+        top_vids = []
+        if CENTROID_FAISS is not None:
+            vids_k = min(videos_to_consider, CENTROID_FAISS.ntotal)
+            top_vids = top_videos_by_centroid(query, vids_k)
+            if allowed_vids:
+                top_vids = [v for v in top_vids if v in allowed_vids]
+            if not top_vids and allowed_vids:
+                # If filter removed all, fall back to allowed set head
+                top_vids = list(allowed_vids)[:videos_to_consider]
 
-# 6.2 video pre-selection (if centroids exist)
-top_videos = top_videos_by_centroid(qv, top_v=videos_to_consider)
-use_video_filter = len(top_videos) > 0
+        # 2) Chunk search
+        if top_vids:
+            hits = _search_chunks_in_videos(query, top_vids, candidate_chunks)
+        else:
+            # direct global search then filter by allowed_vids if any
+            raw = _search_chunks_global(query, candidate_chunks)
+            if allowed_vids:
+                metas = mp.get("metas", [])
+                hits = [(i, s) for (i, s) in raw
+                        if str(metas[i].get("video_id") or metas[i].get("vid") or metas[i].get("id") or "") in allowed_vids]
+                if not hits:  # if filtering wipes everything, use raw
+                    hits = raw
+            else:
+                hits = raw
 
-# 6.3 search the chunk-level index
-scores, idxs = search_chunks_in_index(qv, ix, candidate_chunks)
+        # 3) Gather evidence chunks while limiting per-video
+        metas = mp.get("metas", [])
+        per_vid = Counter()
+        chosen_rows: List[int] = []
+        for i, _score in hits:
+            vid = str(metas[i].get("video_id") or metas[i].get("vid") or metas[i].get("id") or "")
+            if per_vid[vid] >= max_chunks_per_video:
+                continue
+            per_vid[vid] += 1
+            chosen_rows.append(i)
+            if len(chosen_rows) >= evidence_kept:
+                break
 
-# 6.4 if we have preselected videos, filter hits to those videos; else take top-K directly
-if use_video_filter:
-    kept = filter_hits_to_videos(idxs, top_videos, metas, keep=evidence_kept * 3)
-    # fall back if filtering yields too few
-    if len(kept) < evidence_kept:
-        kept = [int(i) for i in idxs if i >= 0][:evidence_kept * 2]
-else:
-    kept = [int(i) for i in idxs if i >= 0][:evidence_kept * 2]
+        # 4) Fetch text for chosen rows by streaming JSONL once
+        want = set(chosen_rows)
+        row2text: Dict[int,str] = {}
+        row2meta: Dict[int,Dict] = {}
+        row_idx = -1
+        for row_idx, j in enumerate(iter_chunks(CHUNK_FP)):
+            if row_idx in want:
+                row2text[row_idx] = j["text"]
+                row2meta[row_idx] = {"video_id": j["video_id"], "start": j["start"]}
+            if len(row2text) == len(want):
+                break
 
-# 6.5 read those chunk texts from disk and group by video
-grouped_chunks = gather_chunks_text(kept, max_per_video=max_chunks_per_video)
+        # 5) Build simple final answer (LLM call left as stub)
+        st.markdown("### Suggested plan")
+        st.write(
+            "This section would call your preferred LLM with the selected evidence to produce a concise, "
+            "actionable answer. For now, it lists the chosen evidence snippets."
+        )
 
-# 6.6 finally trim to the requested evidence_kept total
-flat_pairs = []
-for vid, pairs in grouped_chunks.items():
-    for p in pairs:
-        flat_pairs.append((vid, p))
-flat_pairs = flat_pairs[:evidence_kept]
+        # Group evidence by video and show nested
+        st.markdown("### Sources")
+        by_vid = defaultdict(list)
+        for rid in chosen_rows:
+            md = row2meta.get(rid, {})
+            by_vid[md.get("video_id","")].append((rid, row2text.get(rid,""), md.get("start",0.0)))
 
-# rebuild grouped dict after trimming
-grouped_final: Dict[str, List[Tuple[int, str]]] = {}
-for vid, (idx, txt) in flat_pairs:
-    grouped_final.setdefault(vid, []).append((idx, txt))
+        for vid, items in by_vid.items():
+            rec = TITLE_MAP.get(vid, {})
+            ch  = rec.get("channel","")
+            title = rec.get("title","(no title)")
+            with st.expander(f"{title} — {ch}  •  {len(items)} chunk(s)"):
+                for _rid, txt, start in items:
+                    st.caption(f"t={int(start)}s")
+                    st.write(txt)
 
-retrieval_ms = int((time.time() - t0) * 1000)
+        st.caption(f"Search completed in {time.time()-t0:.2f}s")
 
-# ---------------------------------------------------------------------------
-# 7) ANSWER
-# ---------------------------------------------------------------------------
-t1 = time.time()
-answer = synthesize_answer(question, grouped_final, titles_map)
-gen_ms = int((time.time() - t1) * 1000)
+    except Exception as e:
+        st.error(f"Unexpected error: {e}")
 
-# Show the AI answer
-st.subheader("Answer")
-st.write(answer)
-
-# Small timing note (useful when tuning)
-st.caption(f"Retrieval: {retrieval_ms} ms, Synthesis: {gen_ms} ms")
-
-# ---------------------------------------------------------------------------
-# 8) SOURCES — GROUPED BY VIDEO
-# ---------------------------------------------------------------------------
-st.subheader("Sources")
-if not grouped_final:
-    st.write("No sources were selected for this answer.")
-else:
-    # group display per video with title, then its selected chunks
-    for vid, pairs in grouped_final.items():
-        title = titles_map.get(str(vid), f"Video {vid}")
-        with st.expander(f"{title}  ·  id={vid}  ·  {len(pairs)} selected chunk(s)", expanded=False):
-            for idx, txt in pairs:
-                st.markdown(f"**Chunk #{idx}**")
-                st.code(txt or "∅")
-
-# End of file
+# ── 7) Minimal “How it works” help (kept concise, non-technical) ───────────────
+with st.expander("How it works", expanded=False):
+    st.write(
+        """
+        - The app stores data in a volume at `/var/data`.
+        - It loads a FAISS index of chunk embeddings and searches efficiently.
+        - If per-video “centroids” exist, it first picks likely videos, then searches inside them.
+        - It never loads all text into memory. It streams chunk texts directly from file.
+        """
+    )
