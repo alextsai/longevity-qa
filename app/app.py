@@ -25,6 +25,16 @@ try:
 except Exception:
     requests=None; BeautifulSoup=None
 
+# --- ADMIN: one-time precompute ---
+with st.sidebar.expander("Admin tools", expanded=False):
+    if st.button("Rebuild video summaries now"):
+        try:
+            import scripts.precompute_video_summaries as pcs
+            pcs.main()  # or pcs.precompute() if that's your entry point
+            st.success("Precompute complete.")
+        except Exception as e:
+            st.error(f"Precompute failed: {e}")
+
 # ------------ Paths ------------
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
