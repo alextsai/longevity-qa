@@ -35,4 +35,4 @@ COPY . .
 EXPOSE 8080
 
 # ---- Boot: fetch data into /var/data, build offsets, then start app ----
-CMD ["bash","-lc","which python || true; python -V || true; export DATA_DIR=/var/data; python scripts/bootstrap_data.py || true; python -m streamlit run app/app.py --server.port=8080 --server.address=0.0.0.0"]
+CMD ["bash", "-lc", "python scripts/bootstrap_data.py && streamlit run app/app.py --server.port=8080 --server.address=0.0.0.0"]
