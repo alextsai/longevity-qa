@@ -3,16 +3,19 @@
 """
 Longevity / Nutrition Q&A — Experts-first RAG with trusted web support
 
-This file includes all requested enhancements:
-
-- Clear Chat works reliably via a callback.
-- Experts (channels/podcasters) and Trusted sites are checkbox lists, default checked.
-- Dr. Pradip Jamnadas, MD is INCLUDED; The Primal Podcast, The Diary of a CEO, Louis Tomlinson are excluded globally.
-- Web snippets are supporting evidence by default; if no video evidence exists you may optionally allow a web-only fallback (see WEB_FALLBACK flag).
-- System prompt enumerates medication classes and drug names when the sources provide them.
-- Admin-only diagnostics panel (hidden from users) to verify precompute freshness and keyword coverage (e.g., ApoB).
+Enhancements in this revision:
+- Clear Chat works via a callback.
+- Experts and Trusted sites shown as VERTICAL checkbox lists (default checked).
+  • Section-level help text (no per-item tooltips).
+  • Experts list shows video counts per creator.
+  • Removed “Pin specific videos”.
+- Creators removed from UI and routing:
+  Dr. Pradip Jamnadas, MD; The Primal Podcast; The Diary of a CEO; Louis Tomlinson.
+- Web snippets are supporting evidence; optional web-only fallback controlled by env WEB_FALLBACK.
+- Admin-only diagnostics panel (hidden for normal users) checks precompute freshness and keyword coverage.
 - Two-stage retrieval: per-video centroid routing + chunk search with MMR and recency blending.
 - Precompute freshness warning when chunks.jsonl is newer than centroids.
+- Safer admin gate (never crashes if secrets unset).
 
 Data paths and model choices remain unchanged (DATA_DIR=/var/data).
 """
@@ -65,9 +68,9 @@ VID_SUM_JSON    = DATA_ROOT / "data/catalog/video_summaries.json"  # {vid:{title
 
 REQUIRED = [INDEX_PATH, METAS_PKL, CHUNKS_PATH, VIDEO_META_JSON]
 
-# ------------------ Product choices / flags ------------------
-# If True: when no videos match, allow a web-only answer but clearly label it.
-WEB_FALLBACK = True  # set False to enforce "web = supporting-only" hard stop
+# ------------------ Product flags ------------------
+# Allow web-only answers when no videos match. Read from env; defaults to true.
+WEB_FALLBACK = os.getenv("WEB_FALLBACK", "true").strip().lower() in {"1","true","yes","on"}
 
 # ------------------ Trusted domains (supporting evidence) ------------------
 TRUSTED_DOMAINS = [
@@ -77,12 +80,12 @@ TRUSTED_DOMAINS = [
 ]
 
 # ------------------ Creators to permanently exclude from UI and routing ------------------
-# Dr. Pradip Jamnadas, MD is intentionally NOT listed here (included).
 EXCLUDED_CREATORS = {
-    "NA",
+    "Dr. Pradip Jamnadas, MD",
     "The Primal Podcast",
     "The Diary of a CEO",
     "Louis Tomlinson",
+    "NA",
 }
 
 # ------------------ Small utilities ------------------
@@ -125,25 +128,27 @@ def _clear_chat():
     st.rerun()
 
 # ----- Admin / diagnostics gate -----
-def _is_admin()->bool:
-    """
-    Admin if any:
-      - ENV DEV_MODE=1, or
-      - URL has ?admin=1 and optional ?key= matches st.secrets['ADMIN_KEY'] if set.
-    """
+def _is_admin() -> bool:
+    """Admin if DEV_MODE=1 or URL ?admin=1 (+ optional ?key= matches ADMIN_KEY)."""
+    if os.getenv("DEV_MODE", "0") == "1":
+        return True
+    # URL param
     try:
         qp = st.experimental_get_query_params()
     except Exception:
         qp = {}
-    from_env = os.getenv("DEV_MODE","0") == "1"
-    from_qs  = (qp.get("admin", ["0"])[0] == "1")
-    if not (from_env or from_qs):
+    if qp.get("admin", ["0"])[0] != "1":
         return False
-    expected = getattr(st, "secrets", {}).get("ADMIN_KEY") if hasattr(st, "secrets") else None
-    if expected:
-        supplied = qp.get("key", [""])[0]
-        return supplied == str(expected)
-    return True
+    # Optional key check
+    expected = None
+    try:
+        expected = st.secrets["ADMIN_KEY"]  # KeyError if missing
+    except Exception:
+        expected = None
+    if expected is None:
+        return True
+    supplied = qp.get("key", [""])[0]
+    return supplied == str(expected)
 
 # ------------------ Diagnostics helpers (admin-only usage) ------------------
 def precompute_status(embedder_model: str) -> Dict[str, Any]:
@@ -360,7 +365,7 @@ def stageA_route_videos(
 )->List[str]:
     """
     Stage A: pick top-N videos by centroid cosine blended with recency.
-    Pinned videos get a small constant boost so they survive the cut if similar.
+    Pinned videos support remains but we pass an empty set (we removed the UI).
     """
     sims = (C @ qv.reshape(-1,1)).ravel()
     now=time.time(); pinned = pinned or set()
@@ -386,11 +391,6 @@ def stageB_search_chunks(
 )->List[Dict[str,Any]]:
     """
     Stage B: search within routed/allowed videos then enforce quotas.
-    - ANN over chunks -> collect texts/metas
-    - Filter to allowed videos
-    - Optional MMR for diversity
-    - Blend ANN score with recency
-    - Cap #passages per video and #videos overall
     """
     if index is None:
         return []
@@ -471,7 +471,7 @@ def group_hits_by_video(hits:List[Dict[str,Any]])->Dict[str,List[Dict[str,Any]]]
     return g
 
 def build_grouped_evidence_for_prompt(hits:List[Dict[str,Any]], vm:dict, summaries:dict, max_quotes:int=3)->str:
-    """Compact block for the LLM: label as [Video k], show creator/date, 1-liner summary + timed quotes."""
+    """Compact block for the LLM: [Video k], creator/date, optional 1-liner summary + timed quotes."""
     groups=group_hits_by_video(hits)
     ordered=sorted(groups.items(), key=lambda kv: max(x["score"] for x in kv[1]), reverse=True)
     lines=[]
@@ -660,40 +660,38 @@ with st.sidebar:
         help="First pick likely videos, then search inside them."
     )
 
-    # ---------- Experts: checkbox list (default checked; uncheck to exclude) ----------
+    # ---------- Experts: vertical checkbox list (default checked; uncheck to exclude) ----------
     vm = load_video_meta()
 
     def _creator_of(vid:str)->str:
         info = vm.get(vid,{})
         return info.get("podcaster") or info.get("channel") or "Unknown"
 
-    creators_all = sorted({ _creator_of(v) for v in vm })
-    creators_all = [c for c in creators_all if c not in EXCLUDED_CREATORS]
+    # Build creator -> count mapping, excluding banned creators
+    counts: Dict[str,int] = {}
+    for vid in vm:
+        c = _creator_of(vid)
+        if c in EXCLUDED_CREATORS:
+            continue
+        counts[c] = counts.get(c, 0) + 1
+
+    creators_all = sorted(counts.keys(), key=lambda x: x.lower())
 
     st.subheader("Experts")
-    exp_cols = st.columns(3)  # 3-column grid for readability
+    st.caption("Choose the channels/podcasters to include. All are selected by default. Uncheck to exclude.")
     selected_creators_list = []
     for i, name in enumerate(creators_all):
-        col = exp_cols[i % 3]
-        if col.checkbox(name, value=True, key=f"exp_{i}", help="Uncheck to exclude this expert."):
+        label = f"{name} ({counts.get(name,0)})"
+        if st.checkbox(label, value=True, key=f"exp_{i}"):
             selected_creators_list.append(name)
     selected_creators: Set[str] = set(selected_creators_list)
 
     # Candidate video pool respects chosen experts
     vids_pool = [vid for vid in vm if _creator_of(vid) in selected_creators]
 
-    # Optional: pin specific videos to give them a small routing boost
-    vid_labels = [f"{vm.get(vid,{}).get('title','(no title)')}  [{vid}]" for vid in vids_pool]
-    chosen_vid_labels = st.multiselect(
-        "Pin specific videos (optional)",
-        options=vid_labels, default=[],
-        help="Pinned videos get a small boost in routing."
-    )
-    lookup_pin = {f"{vm.get(vid,{}).get('title','(no title)')}  [{vid}]": vid for vid in vids_pool}
-    chosen_vids: Set[str] = {lookup_pin[x] for x in chosen_vid_labels} if chosen_vid_labels else set()
-
-    # ---------- Trusted sites: checkbox list (default checked) ----------
+    # ---------- Trusted sites: vertical checkbox list (default checked) ----------
     st.subheader("Trusted sites")
+    st.caption("Short, reliable excerpts that support the expert videos. All are selected by default. Uncheck to exclude.")
     allow_web = st.checkbox(
         "Add supporting excerpts from trusted sites",
         value=True,
@@ -703,11 +701,9 @@ with st.sidebar:
         disabled=(requests is None or BeautifulSoup is None)
     )
 
-    ts_cols = st.columns(3)
     selected_domains = []
     for i, dom in enumerate(TRUSTED_DOMAINS):
-        col = ts_cols[i % 3]
-        if col.checkbox(dom, value=True, key=f"site_{i}", help="Uncheck to exclude this site."):
+        if st.checkbox(dom, value=True, key=f"site_{i}"):
             selected_domains.append(dom)
 
     max_web = st.slider(
@@ -791,9 +787,9 @@ if _is_admin():
         st.metric("IDs present", "Yes" if status["ids_present"] else "No")
         st.metric("Summaries present", "Yes" if status["summaries_present"] else "No")
     with col2:
-        st.metric("Shapes OK", "Yes" if status["ok_shapes"] else "No")
-        st.metric("Norms ~1.0", "Yes" if status["ok_norms"] else "No")
-        st.metric("Dim matches encoder", "Yes" if status["ok_dim"] else "No")
+        st.metric("Shapes OK", "Yes" if status.get("ok_shapes") is True else "No" if status.get("ok_shapes") is False else "n/a")
+        st.metric("Norms ~1.0", "Yes" if status.get("ok_norms") is True else "No" if status.get("ok_norms") is False else "n/a")
+        st.metric("Dim matches encoder", "Yes" if status.get("ok_dim") is True else "No" if status.get("ok_dim") is False else "n/a")
     with col3:
         st.caption(f"chunks.jsonl mtime: {datetime.fromtimestamp(status['chunks_mtime']).isoformat() if status['chunks_mtime'] else 'n/a'}")
         st.caption(f"centroids mtime: {datetime.fromtimestamp(status['cent_mtime']).isoformat() if status['cent_mtime'] else 'n/a'}")
@@ -849,19 +845,19 @@ with st.spinner("Routing to likely videos…"):
         info = vm.get(vid,{})
         return info.get("podcaster") or info.get("channel") or "Unknown"
 
-    # Allowed videos = all from checked experts, or pinned subset if any
+    # Allowed videos = all from checked experts
     allowed_vids_all = [
         vid for vid in (vid_list or list(vm.keys()))
         if _creator_of_vid(vid) in selected_creators
     ]
-    allowed_vids = set(chosen_vids) if chosen_vids else set(allowed_vids_all)
+    allowed_vids = set(allowed_vids_all)
 
-    PIN_BOOST = 0.05  # small bump for pinned videos
+    # Route using centroids when present
     if C is not None and vid_list is not None:
         routed_vids = stageA_route_videos(
             qv, C, vid_list, int(topN_videos),
             allowed_vids, vm, float(recency_weight), float(half_life),
-            pin_boost=PIN_BOOST, pinned=chosen_vids
+            pin_boost=0.0, pinned=set()  # no pin UI
         )
         candidate_vids = set(routed_vids)
     else:
@@ -883,7 +879,7 @@ with st.spinner("Searching inside selected videos…"):
 
 # ------------------ Optional supporting web ------------------
 web_snips=[]
-if allow_web and selected_domains:
+if allow_web and selected_domains and requests and BeautifulSoup and int(max_web) > 0:
     with st.spinner("Fetching trusted websites…"):
         web_snips = fetch_trusted_snippets(prompt, selected_domains, max_snippets=int(max_web))
 
