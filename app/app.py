@@ -134,20 +134,44 @@ def _load_catalog():
 
 @st.cache_resource(show_spinner=False)
 def _load_titles_map():
-    # light map {video_id: title}
+    """
+    Returns {video_id: title}. Handles both list-of-dicts and dict-of-dicts formats.
+    """
+    # Prefer precomputed summaries
     if VID_SUMMARIES_PATH.exists():
         try:
             d = json.loads(VID_SUMMARIES_PATH.read_text(encoding="utf-8"))
-            return {k: v.get("title", "") for k, v in d.items()}
+            if isinstance(d, dict):
+                # dictionary of {id: {title: ...}} OR {id: title}
+                out = {}
+                for k, v in d.items():
+                    if isinstance(v, dict):
+                        out[k] = v.get("title", "")
+                    else:
+                        out[k] = str(v)
+                return out
+            elif isinstance(d, list):
+                # list of {id:..., title:...}
+                return {str(x.get("video_id") or x.get("id") or ""): x.get("title", "") for x in d}
         except Exception:
             pass
-    # fallback to catalog titles
+
+    # Fallback to catalog (list or dict)
     cat = _load_catalog()
     m = {}
-    for row in cat:
-        vid = str(row.get("video_id") or row.get("id") or "")
-        if vid:
-            m[vid] = row.get("title") or ""
+    if isinstance(cat, dict):
+        for k, v in cat.items():
+            if isinstance(v, dict):
+                m[str(k)] = v.get("title", "")
+            else:
+                m[str(k)] = str(v)
+    elif isinstance(cat, list):
+        for row in cat:
+            if not isinstance(row, dict):
+                continue
+            vid = str(row.get("video_id") or row.get("id") or "")
+            if vid:
+                m[vid] = row.get("title") or ""
     return m
 
 # Minimal, fast JSONL streaming to avoid loading all chunks at once
