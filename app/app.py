@@ -1,27 +1,30 @@
 # app/app.py
 # -*- coding: utf-8 -*-
 """
-Longevity / Nutrition Q&A
+Longevity / Nutrition Q&A — Experts-first RAG with trusted web support
 
-Incremental enhancements in this revision (non-breaking):
-- Clear Chat now fully resets conversation state via a callback.
-- Experts and Trusted sites use checkbox lists (default = checked, uncheck to exclude).
-- System prompt clarified to enumerate medication classes and drug names when present in evidence.
-- All prior logic preserved: experts-first retrieval, web as supporting-only, MMR, recency blending,
-  precompute freshness checks, pinned-video boost, grouped sources UI, JSON export.
-- Detailed inline comments explain each section.
+This file includes all requested enhancements:
 
-Data paths and models unchanged (DATA_DIR=/var/data; model choices unchanged).
+- Clear Chat works reliably via a callback.
+- Experts (channels/podcasters) and Trusted sites are checkbox lists, default checked.
+- Dr. Pradip Jamnadas, MD is INCLUDED; The Primal Podcast, The Diary of a CEO, Louis Tomlinson are excluded globally.
+- Web snippets are supporting evidence by default; if no video evidence exists you may optionally allow a web-only fallback (see WEB_FALLBACK flag).
+- System prompt enumerates medication classes and drug names when the sources provide them.
+- Admin-only diagnostics panel (hidden from users) to verify precompute freshness and keyword coverage (e.g., ApoB).
+- Two-stage retrieval: per-video centroid routing + chunk search with MMR and recency blending.
+- Precompute freshness warning when chunks.jsonl is newer than centroids.
+
+Data paths and model choices remain unchanged (DATA_DIR=/var/data).
 """
 
 from __future__ import annotations
 
-# ------------------ Environment hygiene: quiet libs and CPU default ------------------
+# ------------------ Environment hygiene (quiet, CPU by default) ------------------
 import os
 os.environ.setdefault("TOKENIZERS_PARALLELISM","false")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY","1")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS","1")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES","")  # Force CPU; avoids accidental GPU usage
+os.environ.setdefault("CUDA_VISIBLE_DEVICES","")  # Force CPU; avoids accidental GPU use
 
 # ------------------ Imports ------------------
 from pathlib import Path
@@ -35,7 +38,7 @@ import faiss
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
-# Optional web deps; if absent we disable web support in the UI gracefully.
+# Optional web deps; if absent we disable web support gracefully.
 try:
     import requests
     from bs4 import BeautifulSoup
@@ -55,14 +58,18 @@ INDEX_PATH      = DATA_ROOT / "data/index/faiss.index"             # FAISS over 
 METAS_PKL       = DATA_ROOT / "data/index/metas.pkl"               # {'metas': [...], 'model': '...'}
 VIDEO_META_JSON = DATA_ROOT / "data/catalog/video_meta.json"       # {vid: {title,url,channel/podcaster,published_at}}
 
-# Precompute outputs (one-time; refreshed when chunks change)
+# Precompute outputs (run scripts/precompute_video_summaries.py after adding videos)
 VID_CENT_NPY    = DATA_ROOT / "data/index/video_centroids.npy"     # [V,d] normalized per-video centroids
 VID_IDS_TXT     = DATA_ROOT / "data/index/video_ids.txt"           # one video_id per line
 VID_SUM_JSON    = DATA_ROOT / "data/catalog/video_summaries.json"  # {vid:{title,channel,published_at,summary,claims}}
 
 REQUIRED = [INDEX_PATH, METAS_PKL, CHUNKS_PATH, VIDEO_META_JSON]
 
-# ------------------ Trusted domains (supporting evidence only) ------------------
+# ------------------ Product choices / flags ------------------
+# If True: when no videos match, allow a web-only answer but clearly label it.
+WEB_FALLBACK = True  # set False to enforce "web = supporting-only" hard stop
+
+# ------------------ Trusted domains (supporting evidence) ------------------
 TRUSTED_DOMAINS = [
     "nih.gov","medlineplus.gov","cdc.gov","mayoclinic.org","health.harvard.edu",
     "familydoctor.org","healthfinder.gov","ama-assn.org","medicalxpress.com",
@@ -70,9 +77,9 @@ TRUSTED_DOMAINS = [
 ]
 
 # ------------------ Creators to permanently exclude from UI and routing ------------------
+# Dr. Pradip Jamnadas, MD is intentionally NOT listed here (included).
 EXCLUDED_CREATORS = {
     "NA",
-    "Dr. Pradip Jamnadas, MD",
     "The Primal Podcast",
     "The Diary of a CEO",
     "Louis Tomlinson",
@@ -113,14 +120,112 @@ def _file_mtime(p:Path)->float:
     except: return 0.0
 
 def _clear_chat():
-    """Hard reset chat state and rerun. Used by Clear Chat buttons."""
+    """Hard reset chat state and rerun. Used by all 'Clear chat' buttons."""
     st.session_state["messages"] = []
     st.rerun()
+
+# ----- Admin / diagnostics gate -----
+def _is_admin()->bool:
+    """
+    Admin if any:
+      - ENV DEV_MODE=1, or
+      - URL has ?admin=1 and optional ?key= matches st.secrets['ADMIN_KEY'] if set.
+    """
+    try:
+        qp = st.experimental_get_query_params()
+    except Exception:
+        qp = {}
+    from_env = os.getenv("DEV_MODE","0") == "1"
+    from_qs  = (qp.get("admin", ["0"])[0] == "1")
+    if not (from_env or from_qs):
+        return False
+    expected = getattr(st, "secrets", {}).get("ADMIN_KEY") if hasattr(st, "secrets") else None
+    if expected:
+        supplied = qp.get("key", [""])[0]
+        return supplied == str(expected)
+    return True
+
+# ------------------ Diagnostics helpers (admin-only usage) ------------------
+def precompute_status(embedder_model: str) -> Dict[str, Any]:
+    """Quick status for centroids/summaries vs chunks and encoder dim."""
+    status = {
+        "centroids_present": VID_CENT_NPY.exists(),
+        "ids_present": VID_IDS_TXT.exists(),
+        "summaries_present": VID_SUM_JSON.exists(),
+        "chunks_mtime": _file_mtime(CHUNKS_PATH),
+        "cent_mtime": _file_mtime(VID_CENT_NPY),
+        "ids_mtime": _file_mtime(VID_IDS_TXT),
+        "ok_shapes": None,
+        "ok_norms": None,
+        "ok_dim": None,
+        "msg": []
+    }
+    try:
+        if status["centroids_present"] and status["ids_present"]:
+            C = np.load(VID_CENT_NPY)
+            vids = VID_IDS_TXT.read_text(encoding="utf-8").splitlines()
+            status["ok_shapes"] = (C.shape[0] == len(vids) and C.ndim == 2)
+            n = np.linalg.norm(C, axis=1) if C.ndim == 2 else np.array([])
+            status["ok_norms"] = bool(len(n) and n.min()>0.90 and n.max()<1.10)
+            try:
+                enc_dim = _load_embedder(embedder_model).get_sentence_embedding_dimension()
+                status["ok_dim"] = (C.shape[1] == enc_dim)
+            except Exception:
+                status["ok_dim"] = False
+            if status["chunks_mtime"] > max(status["cent_mtime"], status["ids_mtime"]):
+                status["msg"].append("chunks.jsonl is newer than centroids → re-run precompute.")
+        else:
+            status["msg"].append("Centroids or IDs missing → run precompute.")
+    except Exception as e:
+        status["msg"].append(f"Precompute check error: {e}")
+    return status
+
+def scan_chunks_for_terms(terms: List[str], vm: Dict[str, Dict[str, Any]], limit_examples:int=200):
+    """
+    Stream chunks.jsonl and collect matches.
+    Returns: dict with totals, per-creator counts, and example rows.
+    """
+    if not CHUNKS_PATH.exists():
+        return {"total_matches":0, "per_creator":{}, "examples":[]}
+    pat = re.compile(r"(" + "|".join([re.escape(t) for t in terms]) + r")", re.IGNORECASE)
+    total = 0
+    per_creator = {}
+    examples = []
+    try:
+        with CHUNKS_PATH.open(encoding="utf-8") as f:
+            for ln in f:
+                try:
+                    j = json.loads(ln)
+                except:
+                    continue
+                t = j.get("text","") or ""
+                if not pat.search(t):
+                    continue
+                m = (j.get("meta") or {})
+                vid = m.get("video_id") or m.get("vid") or m.get("ytid") or j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id") or "Unknown"
+                st_sec = _parse_ts(m.get("start", m.get("start_sec", 0)))
+                info = vm.get(vid, {})
+                creator = info.get("podcaster") or info.get("channel") or "Unknown"
+                per_creator[creator] = per_creator.get(creator, 0) + 1
+                total += 1
+                if len(examples) < int(limit_examples):
+                    snippet = _normalize_text(t)
+                    if len(snippet) > 260: snippet = snippet[:260] + "…"
+                    examples.append({
+                        "video_id": vid,
+                        "creator": creator,
+                        "ts": _format_ts(st_sec),
+                        "snippet": snippet
+                    })
+    except Exception as e:
+        examples.append({"video_id":"", "creator":"", "ts":"", "snippet": f"Scan error: {e}"})
+    per_creator_sorted = dict(sorted(per_creator.items(), key=lambda kv: -kv[1]))
+    return {"total_matches": total, "per_creator": per_creator_sorted, "examples": examples}
 
 # ------------------ Video metadata ------------------
 @st.cache_data(show_spinner=False, hash_funcs={Path:_file_mtime})
 def load_video_meta(vm_path:Path=VIDEO_META_JSON)->Dict[str,Dict[str,Any]]:
-    """Load light per-video metadata. Cache invalidates when file changes."""
+    """Load per-video metadata. Cache invalidates when file changes."""
     if vm_path.exists():
         try: return json.loads(vm_path.read_text(encoding="utf-8"))
         except: return {}
@@ -141,7 +246,7 @@ def _recency_score(published_ts:float, now:float, half_life_days:float)->float:
 def _ensure_offsets()->np.ndarray:
     """
     Build line offsets for chunks.jsonl once. If chunks grows, rebuild.
-    Enables seeking directly to a row by index without loading the whole file.
+    Enables seeking by index without loading the whole file.
     """
     if OFFSETS_NPY.exists():
         try:
@@ -366,7 +471,7 @@ def group_hits_by_video(hits:List[Dict[str,Any]])->Dict[str,List[Dict[str,Any]]]
     return g
 
 def build_grouped_evidence_for_prompt(hits:List[Dict[str,Any]], vm:dict, summaries:dict, max_quotes:int=3)->str:
-    """Compact block for the LLM: label as [Video k], show creator/date, 1-liner + timed quotes."""
+    """Compact block for the LLM: label as [Video k], show creator/date, 1-liner summary + timed quotes."""
     groups=group_hits_by_video(hits)
     ordered=sorted(groups.items(), key=lambda kv: max(x["score"] for x in kv[1]), reverse=True)
     lines=[]
@@ -388,7 +493,7 @@ def build_grouped_evidence_for_prompt(hits:List[Dict[str,Any]], vm:dict, summari
         lines.append("")
     return "\n".join(lines).strip()
 
-# ------------------ Web fetch (supporting-only) ------------------
+# ------------------ Web fetch (supporting and optional fallback) ------------------
 def fetch_trusted_snippets(query:str, allowed_domains:List[str], max_snippets:int=3, per_domain:int=1, timeout:float=6.0):
     """
     Light domain-scoped scraping for supporting evidence.
@@ -419,10 +524,11 @@ def fetch_trusted_snippets(query:str, allowed_domains:List[str], max_snippets:in
     return out[:max_snippets]
 
 # ------------------ LLM call ------------------
-def openai_answer(model_name:str, question:str, history:List[Dict[str,str]], grouped_video_block:str, web_snips:List[Dict[str,str]])->str:
+def openai_answer(model_name:str, question:str, history:List[Dict[str,str]], grouped_video_block:str, web_snips:List[Dict[str,str]], no_video:bool)->str:
     """
-    Grounded synthesis. Priority = expert videos; web = supporting-only.
+    Grounded synthesis. Priority = expert videos; web = supporting.
     Medication questions: enumerate classes and drug names if present in sources.
+    If no_video=True and WEB_FALLBACK, the answer may proceed from web snippets alone but must label it.
     """
     if not os.getenv("OPENAI_API_KEY"):
         return "⚠️ OPENAI_API_KEY is not set."
@@ -445,16 +551,22 @@ def openai_answer(model_name:str, question:str, history:List[Dict[str,str]], gro
         web_lines.append(f"(W{j}) {dom} — {url}\n“{txt}”")
     web_block = "\n".join(web_lines) if web_lines else "None"
 
-    # Experts-first, explicit medication enumeration when supported
+    # Experts-first system prompt; optional web-only fallback label
+    fallback_line = (
+        "If no suitable video evidence exists, you MAY answer from trusted web snippets alone, "
+        "but begin with: 'Web-only evidence'.\n"
+        if (WEB_FALLBACK and no_video) else
+        "Trusted web snippets are supporting evidence.\n"
+    )
     system = (
         "Answer ONLY from the provided evidence. Priority: (1) grouped VIDEO evidence from selected experts, "
-        "(2) trusted WEB snippets as SUPPORTING evidence only.\n"
-        "If video evidence is insufficient or conflicting, say so and list what is missing. Do NOT guess.\n"
+        "(2) trusted WEB snippets.\n" +
+        fallback_line +
         "Rules:\n"
         "• Cite each claim/step: (Video k) for videos, (DOMAIN Wj) for web.\n"
         "• Prefer human clinical data; label animal/in-vitro/mechanistic explicitly.\n"
         "• Normalize units; give concrete ranges only when sources provide them.\n"
-        "• For medication/supplement questions, enumerate evidence-backed OPTIONS by class and example drug names exactly as stated in the sources. "
+        "• For medication/supplement questions, enumerate evidence-backed OPTIONS by class and example drug names exactly as stated in sources. "
         "Include typical starting doses ONLY if sources specify them; otherwise say 'dose not specified'. No diagnosis or individualized advice.\n"
         "• Resolve conflicts by stating both findings and which has higher-quality evidence.\n"
         "Structure:\n"
@@ -467,7 +579,7 @@ def openai_answer(model_name:str, question:str, history:List[Dict[str,str]], gro
     user_payload=((("Recent conversation:\n"+"\n".join(convo)+"\n\n") if convo else "")
         + f"Question: {question}\n\n"
         + "Grouped Video Evidence:\n" + (grouped_video_block or "None") + "\n\n"
-        + "Trusted Web Snippets (supporting only):\n" + web_block + "\n\n"
+        + "Trusted Web Snippets:\n" + web_block + "\n\n"
         + "Write a concise, well-grounded answer.")
 
     try:
@@ -484,7 +596,7 @@ def openai_answer(model_name:str, question:str, history:List[Dict[str,str]], gro
 st.set_page_config(page_title="Longevity / Nutrition Q&A", page_icon="🍎", layout="wide")
 st.title("Longevity / Nutrition Q&A")
 
-# Sidebar: minimal top-level diagnostics toggle to keep main UI clean.
+# Sidebar: minimal diagnostics toggle for file info (not admin-only; harmless)
 with st.sidebar:
     show_diag = st.toggle(
         "Show data diagnostics",
@@ -563,7 +675,6 @@ with st.sidebar:
     selected_creators_list = []
     for i, name in enumerate(creators_all):
         col = exp_cols[i % 3]
-        # Each expert is a checkbox, default checked
         if col.checkbox(name, value=True, key=f"exp_{i}", help="Uncheck to exclude this expert."):
             selected_creators_list.append(name)
     selected_creators: Set[str] = set(selected_creators_list)
@@ -633,9 +744,9 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]): st.markdown(m["content"])
 
 # ------------------ Input ------------------
-prompt = st.chat_input("Ask about sleep, protein timing, fasting, supplements, protocols…")
+prompt = st.chat_input("Ask about sleep, protein timing, ApoB/LDL drugs, fasting, supplements, protocols…")
 if prompt is None:
-    # No input yet: show footer Clear Chat and stop.
+    # Footer Clear Chat and stop.
     cols = st.columns([1,1,1,1,1,1,1,1,1,1,1,1])
     with cols[-1]:
         st.button("Clear chat", key="clear_idle", help="Start a new conversation.", on_click=_clear_chat)
@@ -669,7 +780,66 @@ vm = load_video_meta()
 C, vid_list = load_video_centroids()
 summaries = load_video_summaries()
 
-# ------------------ Stage A: route to videos (experts first) ------------------
+# ------------------ Admin-only Diagnostics Panel (hidden from end users) ------------------
+if _is_admin():
+    st.subheader("Diagnostics (admin)")
+    # Precompute status
+    status = precompute_status(payload["model_name"])
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Centroids present", "Yes" if status["centroids_present"] else "No")
+        st.metric("IDs present", "Yes" if status["ids_present"] else "No")
+        st.metric("Summaries present", "Yes" if status["summaries_present"] else "No")
+    with col2:
+        st.metric("Shapes OK", "Yes" if status["ok_shapes"] else "No")
+        st.metric("Norms ~1.0", "Yes" if status["ok_norms"] else "No")
+        st.metric("Dim matches encoder", "Yes" if status["ok_dim"] else "No")
+    with col3:
+        st.caption(f"chunks.jsonl mtime: {datetime.fromtimestamp(status['chunks_mtime']).isoformat() if status['chunks_mtime'] else 'n/a'}")
+        st.caption(f"centroids mtime: {datetime.fromtimestamp(status['cent_mtime']).isoformat() if status['cent_mtime'] else 'n/a'}")
+        st.caption(f"ids mtime: {datetime.fromtimestamp(status['ids_mtime']).isoformat() if status['ids_mtime'] else 'n/a'}")
+    if status["msg"]:
+        for m in status["msg"]:
+            st.warning(m)
+
+    st.markdown("---")
+    st.markdown("**Keyword coverage scan (admin)**")
+    st.caption("Scans chunks.jsonl for chosen terms. For verification only.")
+    default_terms = ["apob","apo-b","apo b","ldl","statin","ezetimibe","pcsk9","bempedoic","inclisiran","niacin"]
+    term_input = st.text_input("Terms to scan (comma-separated)", ", ".join(default_terms))
+    terms = [t.strip() for t in term_input.split(",") if t.strip()]
+
+    if st.button("Run scan", help="Analyze transcripts for these terms."):
+        with st.spinner("Scanning chunks.jsonl…"):
+            scan = scan_chunks_for_terms(terms, vm, limit_examples=300)
+
+        st.metric("Total matching chunks", scan["total_matches"])
+        if scan["per_creator"]:
+            st.markdown("**Matches by expert**")
+            st.dataframe(
+                [{"expert": k, "matching_chunks": v} for k,v in scan["per_creator"].items()],
+                use_container_width=True
+            )
+        else:
+            st.info("No matches found for these terms.")
+
+        if scan["examples"]:
+            st.markdown("**Example matches**")
+            st.dataframe(scan["examples"], use_container_width=True)
+            st.download_button(
+                "Download examples (CSV)",
+                data=("\n".join(
+                    ["video_id,creator,ts,snippet"] + [
+                        f"{e['video_id']},{e['creator']},{e['ts']},\"{e['snippet'].replace('\"','\"\"')}\""
+                        for e in scan["examples"]
+                    ])
+                ).encode("utf-8"),
+                file_name="diagnostic_examples.csv",
+                mime="text/csv"
+            )
+    st.markdown("---")
+
+# ------------------ Stage A: route to videos (experts-first) ------------------
 routed_vids=[]
 candidate_vids:set[str]=set()
 with st.spinner("Routing to likely videos…"):
@@ -679,7 +849,7 @@ with st.spinner("Routing to likely videos…"):
         info = vm.get(vid,{})
         return info.get("podcaster") or info.get("channel") or "Unknown"
 
-    # Allowed videos = all from checked experts (or later just the pinned set if provided)
+    # Allowed videos = all from checked experts, or pinned subset if any
     allowed_vids_all = [
         vid for vid in (vid_list or list(vm.keys()))
         if _creator_of_vid(vid) in selected_creators
@@ -717,8 +887,8 @@ if allow_web and selected_domains:
     with st.spinner("Fetching trusted websites…"):
         web_snips = fetch_trusted_snippets(prompt, selected_domains, max_snippets=int(max_web))
 
-# Enforce supporting-only: if no video hits, do not answer from web alone.
-if not hits and web_snips:
+# If enforcing "supporting-only", block web-only answers; otherwise allow fallback with label.
+if not hits and web_snips and not WEB_FALLBACK:
     with st.chat_message("assistant"):
         st.warning("No relevant expert video evidence found. Trusted sites are supporting-only. Adjust experts or refine your query.")
     cols = st.columns([1,1,1,1,1,1,1,1,1,1,1,1])
@@ -739,7 +909,7 @@ with st.chat_message("assistant"):
         st.stop()
 
     with st.spinner("Writing your answer…"):
-        ans = openai_answer(model_choice, prompt, st.session_state.messages, grouped_block, web_snips)
+        ans = openai_answer(model_choice, prompt, st.session_state.messages, grouped_block, web_snips, no_video=(len(hits)==0))
 
     st.markdown(ans)
     st.session_state.messages.append({"role":"assistant","content":ans})
@@ -768,7 +938,7 @@ with st.chat_message("assistant"):
             export_payload["videos"].append(v_entry)
 
         if web_snips:
-            st.markdown("**Trusted websites (supporting evidence)**")
+            st.markdown("**Trusted websites**")
             for j,s in enumerate(web_snips,1):
                 st.markdown(f"W{j}. [{s['domain']}]({s['url']})")
                 export_payload["web"].append({"id":f"W{j}","domain":s["domain"],"url":s["url"]})
@@ -788,7 +958,7 @@ st.caption(
     "to refresh video centroids and summaries."
 )
 
-# ------------------ Bottom-right Clear Chat (works via callback) ------------------
+# ------------------ Bottom-right Clear Chat (callback) ------------------
 cols = st.columns([1,1,1,1,1,1,1,1,1,1,1,1])
 with cols[-1]:
     st.button("Clear chat", key="clear_done", help="Start a new conversation.", on_click=_clear_chat)
