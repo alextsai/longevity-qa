@@ -10,7 +10,7 @@ Enhancements in this revision:
   • Experts list shows video counts per creator.
   • Removed “Pin specific videos”.
 - Creators removed from UI and routing:
-  Dr. Pradip Jamnadas, MD; The Primal Podcast; The Diary of a CEO; Louis Tomlinson.
+  Dr. Pradip Jamnadas, MD and The Primal Podcast; The Diary of a CEO and Louis Tomlinson.
 - Web snippets are supporting evidence; optional web-only fallback controlled by env WEB_FALLBACK.
 - Admin-only diagnostics panel (hidden for normal users) checks precompute freshness and keyword coverage.
 - Two-stage retrieval: per-video centroid routing + chunk search with MMR and recency blending.
@@ -81,10 +81,8 @@ TRUSTED_DOMAINS = [
 
 # ------------------ Creators to permanently exclude from UI and routing ------------------
 EXCLUDED_CREATORS = {
-    "Dr. Pradip Jamnadas, MD",
-    "The Primal Podcast",
-    "The Diary of a CEO",
-    "Louis Tomlinson",
+    "Dr. Pradip Jamnadas, MD and The Primal Podcast",
+    "The Diary of a CEO and Louis Tomlinson",
     "NA",
 }
 
