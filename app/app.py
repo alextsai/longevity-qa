@@ -3,15 +3,14 @@
 """
 Longevity / Nutrition Q&A — Experts-first RAG with trusted web support
 
-Adds:
-- Experts allow-list: only 5 creators shown; composite bad names removed.
-- Synonym normalization ("Heathy Immune Doc" -> "Healthy Immune Doc").
-- Admin panel gated by ?admin=1 (+ optional ADMIN_KEY) via st.query_params.
-- Inline Precompute button (admin) to rebuild centroids/ids/summaries.
+This build includes:
+- Experts allow-list (exact set of 5) + composite-name exclusion + synonym normalization.
+- Admin panel gated by ?admin=1 (+ optional ADMIN_KEY) using st.query_params.
+- Inline Precompute button (admin) to build centroids/ids/summaries.
 - Diagnostics: shapes/norms/dim checks; mtimes; keyword scan.
-- Two-stage retrieval with MMR + recency; deduped quotes; JSON export.
+- Two-stage retrieval with MMR + recency; deduped quotes; JSON source export (fixed).
 - Trusted-sites fallback crawl when DDG search fails; “no web excerpts” notice.
-- Strong clinical synthesis prompt with mechanisms, effect sizes, options.
+- Strong clinical synthesis prompt with mechanisms, effect sizes, therapy options.
 """
 
 from __future__ import annotations
@@ -73,7 +72,6 @@ TRUSTED_DOMAINS = [
 ]
 
 # ---------- Experts configuration ----------
-# Canonical allow-list shown in the UI
 ALLOWED_CREATORS = [
     "Dr. Pradip Jamnadas, MD",
     "Andrew Huberman",
@@ -90,13 +88,12 @@ EXCLUDED_CREATORS_EXACT = {
 
 # Common typos/aliases -> canonical
 CREATOR_SYNONYMS = {
-    "heathy immune doc": "Healthy Immune Doc",   # fix typo
+    "heathy immune doc": "Healthy Immune Doc",
     "healthy immune doc": "Healthy Immune Doc",
     "the diary of a ceo": "The Diary of A CEO",
 }
 
 def canonicalize_creator(name: str) -> str | None:
-    """Return canonical allowed creator name, or None if excluded/not allowed."""
     n = (name or "").strip()
     if not n: return None
     low = n.lower()
@@ -144,7 +141,7 @@ def _clear_chat():
 # ---------- Admin gate (URL only) ----------
 def _is_admin()->bool:
     try:
-        qp = st.query_params  # Streamlit >=1.33
+        qp = st.query_params
     except Exception:
         return False
     if qp.get("admin", "0") != "1":
@@ -315,7 +312,7 @@ def _dedupe_passages(items:List[Dict[str,Any]], time_window_sec:float=8.0, min_c
     out=[]; seen=[]
     for h in sorted(items, key=lambda r: float((r.get("meta") or {}).get("start",0))):
         ts=float((h.get("meta") or {}).get("start",0))
-        txt=_normalize_text(h.get("text","")); 
+        txt=_normalize_text(h.get("text",""))
         if len(txt)<min_chars: continue
         if any(abs(ts - float((s.get("meta") or {}).get("start",0)))<=time_window_sec and _normalize_text(s.get("text",""))==txt for s in seen):
             continue
@@ -355,7 +352,7 @@ def stageB_search_chunks(query:str,
     rows=list(iter_jsonl_rows(idxs))
     texts=[]; metas=[]; keep=[]
     for _,j in rows:
-        t=_normalize_text(j.get("text","")); 
+        t=_normalize_text(j.get("text",""))
         if not t: keep.append(False); continue
         m=(j.get("meta") or {}).copy()
         vid=(m.get("video_id") or m.get("vid") or m.get("ytid") or
@@ -433,7 +430,7 @@ def _ddg_domain_search(domain:str, query:str, headers:dict, timeout:float):
     try:
         r=requests.get("https://duckduckgo.com/html/", params={"q":f"site:{domain} {query}"}, headers=headers, timeout=timeout)
         if r.status_code!=200: return []
-        soup=BeautifulSoup(r.text,"html_parser") if False else BeautifulSoup(r.text,"html.parser")
+        soup=BeautifulSoup(r.text,"html.parser")
         return [a.get("href") for a in soup.select("a.result__a") if a.get("href") and domain in a.get("href")]
     except Exception:
         return []
@@ -543,7 +540,6 @@ def _run_precompute_inline()->str:
     vids=sorted(texts_by_vid.keys())
     if not vids: return "no videos in chunks"
 
-    # centroids (normalize)
     centroids=[]
     for vid in vids:
         X=enc.encode(texts_by_vid[vid], normalize_embeddings=True, batch_size=128).astype("float32")
@@ -554,7 +550,6 @@ def _run_precompute_inline()->str:
     np.save(VID_CENT_NPY, C)
     VID_IDS_TXT.write_text("\n".join(vids), encoding="utf-8")
 
-    # summaries (light TF-IDF)
     DF = Counter()
     for vid in vids:
         seen=set()
@@ -836,33 +831,45 @@ with st.chat_message("assistant"):
     st.markdown(ans)
     st.session_state.messages.append({"role":"assistant","content":ans})
 
+    # -------- Sources block (fixed web export and button indent) --------
     with st.expander("Sources & timestamps", expanded=False):
-        groups=group_hits_by_video(hits)
-        ordered=sorted(groups.items(), key=lambda kv: max(x["score"] for x in kv[1]), reverse=True)
-        export={"videos":[],"web":[]}
-        for vid,items in ordered:
-            info=vm.get(vid,{})
-            title=info.get("title") or summaries.get(vid,{}).get("title") or vid
-            creator_raw=info.get("podcaster") or info.get("channel") or ""
-            creator=canonicalize_creator(creator_raw) or creator_raw
-            url=info.get("url") or ""
-            header=f"**{title}**" + (f" — _{creator}_" if creator else "")
+        groups = group_hits_by_video(hits)
+        ordered = sorted(groups.items(), key=lambda kv: max(x["score"] for x in kv[1]), reverse=True)
+
+        export = {"videos": [], "web": []}
+
+        for vid, items in ordered:
+            info = vm.get(vid, {})
+            title = info.get("title") or summaries.get(vid, {}).get("title") or vid
+            creator_raw = info.get("podcaster") or info.get("channel") or ""
+            creator = canonicalize_creator(creator_raw) or creator_raw
+            url = info.get("url") or ""
+            header = f"**{title}**" + (f" — _{creator}_" if creator else "")
             st.markdown(f"- [{header}]({url})" if url else f"- {header}")
-            clean=_dedupe_passages(items, time_window_sec=8.0, min_chars=40)
-            v={"video_id":vid,"title":title,"creator":creator,"url":url,"quotes":[]}
+
+            clean = _dedupe_passages(items, time_window_sec=8.0, min_chars=40)
+
+            v = {"video_id": vid, "title": title, "creator": creator, "url": url, "quotes": []}
             for h in clean:
-                ts=_format_ts((h.get("meta") or {}).get("start",0))
-                q=_normalize_text(h.get("text","")); q=q[:160]+"…" if len(q)>160 else q
+                ts = _format_ts((h.get("meta") or {}).get("start", 0))
+                q = _normalize_text(h.get("text", ""))
+                if len(q) > 160: q = q[:160] + "…"
                 st.markdown(f"  • **{ts}** — “{q}”")
-                v["quotes"].append({"ts":ts,"text":q})
+                v["quotes"].append({"ts": ts, "text": q})
             export["videos"].append(v)
+
         if web_snips:
             st.markdown("**Trusted websites**")
-            for j,s in enumerate(web_snips,1):
+            for j, s in enumerate(web_snips, 1):
                 st.markdown(f"W{j}. [{s['domain']}]({s['url']})")
-export["web"].append({"id": f"W{j}", "domain": s["domain"], "url": s["url"]})
-        st.download_button("Download sources as JSON", data=json.dumps(export, ensure_ascii=False, indent=2),
-                           file_name="sources.json", mime="application/json")
+                export["web"].append({"id": f"W{j}", "domain": s["domain"], "url": s["url"]})
+
+        st.download_button(
+            "Download sources as JSON",
+            data=json.dumps(export, ensure_ascii=False, indent=2),
+            file_name="sources.json",
+            mime="application/json",
+        )
 
 # ---------- Footer hint ----------
 st.caption("If you add new videos or change chunks.jsonl, click 'Rebuild precompute' in admin (?admin=1).")
