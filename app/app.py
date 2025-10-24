@@ -403,19 +403,30 @@ def openai_answer(model_name:str, question:str, history:List[Dict[str,str]], gro
             label="User" if role=="user" else "Assistant"
             convo.append(f"{label}: {content}")
 
-    # Web snippets block
-    web_lines=[f"(W{j}) {s['domain']} — {s['url']}\n“{s['text'][:300]}”" for j,s in enumerate(web_snips,1)]
-    web_block="\n".join(web_lines) if web_lines else "None"
+# Web snippets block  
+web_lines = []
+for j, s in enumerate(web_snips, 1):
+    txt = " ".join((s.get("text","")).split())[:300]
+    dom = s.get("domain","web")
+    url = s.get("url","")
+    web_lines.append(f"(W{j}) {dom} — {url}\n“{txt}”")
+web_block = "\n".join(web_lines) if web_lines else "None"
 
-    system=(
-        "Answer from the provided evidence first. Prioritize grouped video evidence, then trusted web snippets.\n"
-        "Use at most ~4 videos and ~3 trusted web snippets. Merge findings; avoid listing every quote.\n"
-        "Structure:\n"
-        "• Key takeaways. Be specific and detailed. Do not make things up.\n"
-        "• Practical protocol (clear, stepwise, detailed)\n"
-        "• Safety notes and when to consult a clinician\n"
-        "Cite inline like (Video 2) or (CDC W1). If evidence is insufficient, say so."
-    )
+   system = (
+    "Answer from the PROVIDED EVIDENCE ONLY. Priority: (1) grouped video evidence, (2) trusted web snippets.\n"
+    "If evidence is insufficient or conflicting, say so and list what is missing. Do NOT guess.\n"
+    "Rules:\n"
+    "• Cite inline like (Video 2) or (CDC W1) at each claim or step that depends on evidence.\n"
+    "• Normalize units and give concrete ranges when the sources do (e.g., mg, g/kg, minutes, %).\n"
+    "• If human data is absent but animal/mechanistic data is cited, label it clearly.\n"
+    "• Do not give medical diagnosis. Add clinician check flags only when sources indicate it.\n"
+    "• Do not repeat long quotes. Synthesize.\n"
+    "Structure:\n"
+    "• Key takeaways — specific, source-grounded bullets\n"
+    "• Practical protocol — numbered, stepwise, actionable; include doses/timing when provided\n"
+    "• Safety notes — contraindications, interactions, and when to consult a clinician\n"
+    "Output must be concise and free of speculation."
+)
     user_payload=((("Recent conversation:\n"+"\n".join(convo)+"\n\n") if convo else "")
         + f"Question: {question}\n\n"
         + "Grouped Video Evidence:\n" + (grouped_video_block or "None") + "\n\n"
