@@ -76,10 +76,8 @@ TRUSTED_DOMAINS = [
 
 # -------- Creators excluded from UI/routing --------
 EXCLUDED_CREATORS = {
-    "Dr. Pradip Jamnadas, MD",
-    "The Primal Podcast",
-    "The Diary of a CEO",
-    "Louis Tomlinson",
+    "Dr. Pradip Jamnadas, MD and The Primal Podcast",
+    "The Diary of a CEO Longevity / Nutrition Q&Aand Louis Tomlinson",
     "NA",
 }
 
@@ -520,7 +518,7 @@ def openai_answer(model_name: str, question: str, history: List[Dict[str, str]],
         return f"⚠️ Generation error: {e}"
 
 # -------- App UI --------
-st.set_page_config(page_title="Longevity / Nutrition Q&A", page_icon="🍎", layout="wide")
+st.set_page_config(page_title="Health | Longevity | Nutrition Q&A", page_icon="🍎", layout="wide")
 st.title("Longevity / Nutrition Q&A")
 
 with st.sidebar:
