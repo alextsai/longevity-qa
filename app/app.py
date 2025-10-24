@@ -3,16 +3,15 @@
 """
 Longevity / Nutrition Q&A — Experts-first RAG with trusted web support
 
-This build adds:
-- Admin panel gated ONLY by ?admin=1 and optional ADMIN_KEY secret.
-- Inline Precompute button (admin): builds centroids, ids, summaries without shell.
-- Diagnostics refresh: shows Summaries present / Norms≈1.0 after precompute.
-- Trusted-sites fallback: warns if requests/bs4 missing; crawls home pages if DDG fails.
-- “No web excerpts found” banner when web is enabled but returns 0.
-- All prior upgrades kept: vertical Experts/Trusted lists, counts, deduped quotes,
-  two-stage retrieval with MMR+recency, stronger clinical synthesis prompt.
-
-Drop-in replace.
+Adds:
+- Experts allow-list: only 5 creators shown; composite bad names removed.
+- Synonym normalization ("Heathy Immune Doc" -> "Healthy Immune Doc").
+- Admin panel gated by ?admin=1 (+ optional ADMIN_KEY) via st.query_params.
+- Inline Precompute button (admin) to rebuild centroids/ids/summaries.
+- Diagnostics: shapes/norms/dim checks; mtimes; keyword scan.
+- Two-stage retrieval with MMR + recency; deduped quotes; JSON export.
+- Trusted-sites fallback crawl when DDG search fails; “no web excerpts” notice.
+- Strong clinical synthesis prompt with mechanisms, effect sizes, options.
 """
 
 from __future__ import annotations
@@ -73,14 +72,41 @@ TRUSTED_DOMAINS = [
     "sciencedaily.com","nejm.org","med.stanford.edu","icahn.mssm.edu"
 ]
 
-# ---------- Excluded creators ----------
-EXCLUDED_CREATORS = {
+# ---------- Experts configuration ----------
+# Canonical allow-list shown in the UI
+ALLOWED_CREATORS = [
     "Dr. Pradip Jamnadas, MD",
-    "The Primal Podcast",
-    "The Diary of a CEO",
-    "Louis Tomlinson",
-    "NA",
+    "Andrew Huberman",
+    "Healthy Immune Doc",
+    "Peter Attia MD",
+    "The Diary of A CEO",
+]
+
+# Composite bad entries to remove entirely (exact, case-insensitive)
+EXCLUDED_CREATORS_EXACT = {
+    "they diary of a ceo and louse tomlinson",
+    "dr. pradip jamnadas, md and the primal podcast",
 }
+
+# Common typos/aliases -> canonical
+CREATOR_SYNONYMS = {
+    "heathy immune doc": "Healthy Immune Doc",   # fix typo
+    "healthy immune doc": "Healthy Immune Doc",
+    "the diary of a ceo": "The Diary of A CEO",
+}
+
+def canonicalize_creator(name: str) -> str | None:
+    """Return canonical allowed creator name, or None if excluded/not allowed."""
+    n = (name or "").strip()
+    if not n: return None
+    low = n.lower()
+    if low in EXCLUDED_CREATORS_EXACT:
+        return None
+    low = CREATOR_SYNONYMS.get(low, low)
+    for canon in ALLOWED_CREATORS:
+        if low == canon.lower():
+            return canon
+    return None
 
 # ---------- Utils ----------
 def _normalize_text(s:str)->str:
@@ -118,10 +144,10 @@ def _clear_chat():
 # ---------- Admin gate (URL only) ----------
 def _is_admin()->bool:
     try:
-        qp = st.experimental_get_query_params()
+        qp = st.query_params  # Streamlit >=1.33
     except Exception:
         return False
-    if qp.get("admin",["0"])[0]!="1":
+    if qp.get("admin", "0") != "1":
         return False
     try:
         expected = st.secrets["ADMIN_KEY"]
@@ -129,7 +155,7 @@ def _is_admin()->bool:
         expected = None
     if expected is None:
         return True
-    return qp.get("key",[""])[0] == str(expected)
+    return qp.get("key", "") == str(expected)
 
 # ---------- Diagnostics helpers ----------
 def precompute_status(embedder_model:str)->Dict[str,Any]:
@@ -178,11 +204,13 @@ def scan_chunks_for_terms(terms:List[str], vm:Dict[str,Dict[str,Any]], limit_exa
             st_sec=_parse_ts(m.get("start", m.get("start_sec",0)))
             info=vm.get(vid,{})
             creator=info.get("podcaster") or info.get("channel") or "Unknown"
-            per_creator[creator]=per_creator.get(creator,0)+1
+            canon = canonicalize_creator(creator)
+            label = canon if canon else creator
+            per_creator[label]=per_creator.get(label,0)+1
             total+=1
             if len(examples)<int(limit_examples):
                 sn=_normalize_text(t); sn=sn[:260]+"…" if len(sn)>260 else sn
-                examples.append({"video_id":vid,"creator":creator,"ts":_format_ts(st_sec),"snippet":sn})
+                examples.append({"video_id":vid,"creator":label,"ts":_format_ts(st_sec),"snippet":sn})
     per_creator=dict(sorted(per_creator.items(), key=lambda kv:-kv[1]))
     return {"total_matches":total,"per_creator":per_creator,"examples":examples}
 
@@ -227,8 +255,7 @@ def iter_jsonl_rows(indices:List[int], limit:int|None=None):
     if limit is not None: want=want[:limit]
     with CHUNKS_PATH.open("rb") as f:
         for i in want:
-            f.seek(int(offs[i]))
-            raw=f.readline()
+            f.seek(int(offs[i])); raw=f.readline()
             try: yield i, json.loads(raw)
             except: continue
 
@@ -239,8 +266,7 @@ def _load_embedder(model_name:str)->SentenceTransformer:
 
 @st.cache_resource(show_spinner=False)
 def load_metas_and_model(index_path:Path=INDEX_PATH, metas_path:Path=METAS_PKL):
-    if not index_path.exists() or not metas_path.exists():
-        return None, None, None
+    if not index_path.exists() or not metas_path.exists(): return None, None, None
     index = faiss.read_index(str(index_path))
     with metas_path.open("rb") as f:
         payload=pickle.load(f)
@@ -255,8 +281,7 @@ def load_metas_and_model(index_path:Path=INDEX_PATH, metas_path:Path=METAS_PKL):
 
 @st.cache_resource(show_spinner=False)
 def load_video_centroids():
-    if not (VID_CENT_NPY.exists() and VID_IDS_TXT.exists()):
-        return None, None
+    if not (VID_CENT_NPY.exists() and VID_IDS_TXT.exists()): return None, None
     C = np.load(VID_CENT_NPY).astype("float32")
     vids = VID_IDS_TXT.read_text(encoding="utf-8").splitlines()
     if C.shape[0]!=len(vids): return None, None
@@ -290,7 +315,7 @@ def _dedupe_passages(items:List[Dict[str,Any]], time_window_sec:float=8.0, min_c
     out=[]; seen=[]
     for h in sorted(items, key=lambda r: float((r.get("meta") or {}).get("start",0))):
         ts=float((h.get("meta") or {}).get("start",0))
-        txt=_normalize_text(h.get("text",""))
+        txt=_normalize_text(h.get("text","")); 
         if len(txt)<min_chars: continue
         if any(abs(ts - float((s.get("meta") or {}).get("start",0)))<=time_window_sec and _normalize_text(s.get("text",""))==txt for s in seen):
             continue
@@ -300,16 +325,13 @@ def _dedupe_passages(items:List[Dict[str,Any]], time_window_sec:float=8.0, min_c
 # ---------- Stage A ----------
 def stageA_route_videos(qv:np.ndarray, C:np.ndarray, vids:List[str], topN:int,
                         allowed_vids:Set[str]|None, vm:dict,
-                        recency_weight:float, half_life_days:float,
-                        pin_boost:float=0.0, pinned:Set[str]|None=None)->List[str]:
+                        recency_weight:float, half_life_days:float)->List[str]:
     sims=(C @ qv.reshape(-1,1)).ravel()
-    now=time.time(); pinned=pinned or set()
-    blend=[]
+    now=time.time(); blend=[]
     for i,vid in enumerate(vids):
         if allowed_vids and vid not in allowed_vids: continue
         rec=_recency_score(_vid_epoch(vm,vid), now, half_life_days)
         score=(1.0-recency_weight)*float(sims[i]) + recency_weight*float(rec)
-        if vid in pinned: score += float(pin_boost)
         blend.append((vid,score))
     blend.sort(key=lambda x:-x[1])
     return [v for v,_ in blend[:topN]]
@@ -333,7 +355,7 @@ def stageB_search_chunks(query:str,
     rows=list(iter_jsonl_rows(idxs))
     texts=[]; metas=[]; keep=[]
     for _,j in rows:
-        t=_normalize_text(j.get("text",""))
+        t=_normalize_text(j.get("text","")); 
         if not t: keep.append(False); continue
         m=(j.get("meta") or {}).copy()
         vid=(m.get("video_id") or m.get("vid") or m.get("ytid") or
@@ -360,10 +382,10 @@ def stageB_search_chunks(query:str,
     for li in order:
         i_global=idxs[li] if li<len(idxs) else None
         base=scores0[li] if li<len(scores0) else 0.0
-        m=metas[li]; t=texts[li]; vid=m.get("video_id")
+        m=metas[li]; vid=m.get("video_id")
         rec=_recency_score(_vid_epoch(vm,vid), now, half_life_days)
         score=(1.0-recency_weight)*float(base)+recency_weight*float(rec)
-        blended.append((i_global,score,t,m))
+        blended.append((i_global,score,texts[li],m))
     blended.sort(key=lambda x:-x[1])
 
     picked=[]; seen_per_video={}; distinct=[]
@@ -392,7 +414,8 @@ def build_grouped_evidence_for_prompt(hits:List[Dict[str,Any]], vm:dict, summari
     for v_idx,(vid,items) in enumerate(ordered,1):
         info=vm.get(vid,{})
         title=info.get("title") or summaries.get(vid,{}).get("title") or vid
-        creator=info.get("podcaster") or info.get("channel") or summaries.get(vid,{}).get("channel") or "Unknown"
+        creator_raw=info.get("podcaster") or info.get("channel") or "Unknown"
+        creator=canonicalize_creator(creator_raw) or creator_raw
         date=info.get("published_at") or info.get("publishedAt") or info.get("date") or summaries.get(vid,{}).get("published_at") or ""
         lines.append(f"[Video {v_idx}] {title} — {creator}" + (f" — {date}" if date else ""))
         summ=summaries.get(vid,{}).get("summary","")
@@ -410,7 +433,7 @@ def _ddg_domain_search(domain:str, query:str, headers:dict, timeout:float):
     try:
         r=requests.get("https://duckduckgo.com/html/", params={"q":f"site:{domain} {query}"}, headers=headers, timeout=timeout)
         if r.status_code!=200: return []
-        soup=BeautifulSoup(r.text,"html.parser")
+        soup=BeautifulSoup(r.text,"html_parser") if False else BeautifulSoup(r.text,"html.parser")
         return [a.get("href") for a in soup.select("a.result__a") if a.get("href") and domain in a.get("href")]
     except Exception:
         return []
@@ -421,9 +444,7 @@ def fetch_trusted_snippets(query:str, allowed_domains:List[str], max_snippets:in
     out=[]
     for domain in allowed_domains:
         links=_ddg_domain_search(domain, query, headers, timeout)
-        if not links:
-            # fallback: crawl root page text
-            links=[f"https://{domain}"]
+        if not links: links=[f"https://{domain}"]  # fallback simple crawl
         links=links[:per_domain]
         for url in links:
             try:
@@ -449,10 +470,7 @@ def openai_answer(model_name:str, question:str, history:List[Dict[str,str]], gro
             label="User" if role=="user" else "Assistant"
             convo.append(f"{label}: {content}")
 
-    web_lines=[]
-    for j,s in enumerate(web_snips,1):
-        txt=" ".join((s.get("text","")).split())[:300]
-        web_lines.append(f"(W{j}) {s.get('domain','web')} — {s.get('url','')}\n“{txt}”")
+    web_lines=[f"(W{j}) {s.get('domain','web')} — {s.get('url','')}\n“{' '.join((s.get('text','')).split())[:300]}”" for j,s in enumerate(web_snips,1)]
     web_block="\n".join(web_lines) if web_lines else "None"
 
     fallback_line = (
@@ -499,9 +517,7 @@ def openai_answer(model_name:str, question:str, history:List[Dict[str,str]], gro
 
 # ---------- Inline precompute (admin) ----------
 def _run_precompute_inline()->str:
-    if not CHUNKS_PATH.exists():
-        return "missing chunks.jsonl"
-    # encoder aligned with FAISS
+    if not CHUNKS_PATH.exists(): return "missing chunks.jsonl"
     try:
         _, _, payload = load_metas_and_model()
     except Exception as e:
@@ -541,12 +557,12 @@ def _run_precompute_inline()->str:
     # summaries (light TF-IDF)
     DF = Counter()
     for vid in vids:
-        toks_seen=set()
+        seen=set()
         for t in texts_by_vid[vid]:
             toks=set(w.lower() for w in t.split())
             for w in toks:
-                if w in toks_seen: continue
-                DF[w]+=1; toks_seen.add(w)
+                if w in seen: continue
+                DF[w]+=1; seen.add(w)
     N=len(vids)
     def score_text(t):
         from collections import Counter as Ctr
@@ -623,25 +639,25 @@ with st.sidebar:
     topN_videos = st.number_input("Videos to consider before chunk search", 1, 50, 15, 1,
         help="Pick likely videos first, then search inside them.")
 
-    # Experts vertical list
+    # Experts vertical list (allow-list only)
     vm = load_video_meta()
-    def _creator_of(vid:str)->str:
+    def _raw_creator_of(vid:str)->str:
         info=vm.get(vid,{})
         return info.get("podcaster") or info.get("channel") or "Unknown"
-    counts={}
+
+    counts={canon:0 for canon in ALLOWED_CREATORS}
     for vid in vm:
-        c=_creator_of(vid)
-        if c in EXCLUDED_CREATORS: continue
-        counts[c]=counts.get(c,0)+1
-    creators_all=sorted(counts.keys(), key=lambda x:x.lower())
+        canon = canonicalize_creator(_raw_creator_of(vid))
+        if canon is None: continue
+        counts[canon]=counts.get(canon,0)+1
 
     st.subheader("Experts")
     st.caption("Choose the channels/podcasters to include. All are selected by default. Uncheck to exclude.")
     selected_creators_list=[]
-    for i,name in enumerate(creators_all):
-        label=f"{name} ({counts.get(name,0)})"
+    for i, canon in enumerate(ALLOWED_CREATORS):
+        label=f"{canon} ({counts.get(canon,0)})"
         if st.checkbox(label, value=True, key=f"exp_{i}"):
-            selected_creators_list.append(name)
+            selected_creators_list.append(canon)
     selected_creators:set[str]=set(selected_creators_list)
 
     # Trusted sites vertical list
@@ -710,8 +726,7 @@ if _is_admin():
         with st.spinner("Building centroids and summaries…"):
             msg=_run_precompute_inline()
         st.success(str(msg))
-        st.cache_resource.clear()  # refresh centroids/model caches
-        st.cache_data.clear()
+        st.cache_resource.clear(); st.cache_data.clear()
         st.rerun()
 
     st.markdown("---")
@@ -724,8 +739,7 @@ if _is_admin():
             scan=scan_chunks_for_terms(terms, load_video_meta(), limit_examples=300)
         st.metric("Total matching chunks", scan["total_matches"])
         if scan["per_creator"]: st.dataframe([{"expert":k,"matching_chunks":v} for k,v in scan["per_creator"].items()], use_container_width=True)
-        if scan["examples"]:
-            st.dataframe(scan["examples"], use_container_width=True)
+        if scan["examples"]: st.dataframe(scan["examples"], use_container_width=True)
     st.markdown("---")
 
 # ---------- Prompt ----------
@@ -746,7 +760,7 @@ if missing:
         st.error("Missing required files:\n" + "\n".join(f"- {p}" for p in missing))
     st.stop()
 
-# ---------- Load index+encoder again (for safety) ----------
+# ---------- Load index+encoder ----------
 try:
     index, _, payload = load_metas_and_model()
 except Exception as e:
@@ -762,10 +776,13 @@ summaries = load_video_summaries()
 routed_vids=[]; candidate_vids:set[str]=set()
 with st.spinner("Routing to likely videos…"):
     qv=embedder.encode([prompt], normalize_embeddings=True).astype("float32")[0]
-    def _creator_of_vid(vid:str)->str:
-        info=vm.get(vid,{})
-        return info.get("podcaster") or info.get("channel") or "Unknown"
-    allowed_vids = {vid for vid in (vid_list or list(vm.keys())) if _creator_of_vid(vid) in selected_creators}
+    def _creator_of_vid(vid:str)->str|None:
+        raw = vm.get(vid,{}).get("podcaster") or vm.get(vid,{}).get("channel") or "Unknown"
+        return canonicalize_creator(raw)
+    allowed_vids = {
+        vid for vid in (vid_list or list(vm.keys()))
+        if (_creator_of_vid(vid) in selected_creators)
+    }
     if C is not None and vid_list is not None:
         routed_vids = stageA_route_videos(qv, C, vid_list, int(topN_videos), allowed_vids, vm, float(recency_weight), float(half_life))
         candidate_vids=set(routed_vids)
@@ -826,7 +843,8 @@ with st.chat_message("assistant"):
         for vid,items in ordered:
             info=vm.get(vid,{})
             title=info.get("title") or summaries.get(vid,{}).get("title") or vid
-            creator=info.get("podcaster") or info.get("channel") or summaries.get(vid,{}).get("channel") or ""
+            creator_raw=info.get("podcaster") or info.get("channel") or ""
+            creator=canonicalize_creator(creator_raw) or creator_raw
             url=info.get("url") or ""
             header=f"**{title}**" + (f" — _{creator}_" if creator else "")
             st.markdown(f"- [{header}]({url})" if url else f"- {header}")
@@ -842,7 +860,7 @@ with st.chat_message("assistant"):
             st.markdown("**Trusted websites**")
             for j,s in enumerate(web_snips,1):
                 st.markdown(f"W{j}. [{s['domain']}]({s['url']})")
-                export["web"].append({"id":f"W{j}","domain":s["domain"],"url":s["url"]})
+                export["web"].append({"id":f"W{j}","domain":s["domain"]","url":s["url"]})
         st.download_button("Download sources as JSON", data=json.dumps(export, ensure_ascii=False, indent=2),
                            file_name="sources.json", mime="application/json")
 
