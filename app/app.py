@@ -860,7 +860,7 @@ with st.chat_message("assistant"):
             st.markdown("**Trusted websites**")
             for j,s in enumerate(web_snips,1):
                 st.markdown(f"W{j}. [{s['domain']}]({s['url']})")
-                export["web"].append({"id":f"W{j}","domain":s["domain"]","url":s["url"]})
+export["web"].append({"id": f"W{j}", "domain": s["domain"], "url": s["url"]})
         st.download_button("Download sources as JSON", data=json.dumps(export, ensure_ascii=False, indent=2),
                            file_name="sources.json", mime="application/json")
 
