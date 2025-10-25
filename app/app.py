@@ -1,13 +1,13 @@
 # app/app.py
 # -*- coding: utf-8 -*-
 """
-Longevity / Nutrition Q&A — Experts-first RAG with trusted web support
+Longevity / Nutrition Q&A — experts-first RAG with trusted web support.
 
-Flow:
-- Route → then scan: rank videos by bullets+centroid+recency; pick top 5; search chunks only in those.
-- Extractive bullets with timestamps; answers cite videos (Video k) and web (DOMAIN Wj).
-- Experts and trusted sites: vertical checklists, all selected by default; per-expert counts; creator normalization.
-- Admin: precompute rebuild, norms/dim checks, mtimes, freshness check, keyword scan, file-path debug, centroid-norm repair.
+Highlights
+- Route then scan: rank videos by bullets + centroid + recency, pick top 5, then search only those videos.
+- Experts and trusted sites are vertical checklists. All selected by default. Per-expert video counts shown.
+- Admin panel: rebuild precompute, repair centroid norms, build summaries fallback, freshness checks, keyword scan.
+- Sources export as JSON from the expander.
 """
 
 from __future__ import annotations
@@ -29,16 +29,17 @@ import faiss
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
-# Optional web fetch
+# Optional web fetch (safe if not installed)
 try:
     import requests
     from bs4 import BeautifulSoup
 except Exception:
     requests=None; BeautifulSoup=None
 
-# ------------ Paths ------------
+# ---------------- Paths ----------------
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 DATA_ROOT = Path(os.getenv("DATA_DIR","/var/data")).resolve()
 CHUNKS_PATH     = DATA_ROOT / "data/chunks/chunks.jsonl"
@@ -55,14 +56,14 @@ VID_SUM_JSON    = DATA_ROOT / "data/catalog/video_summaries.json"
 REQUIRED = [INDEX_PATH, METAS_PKL, CHUNKS_PATH, VIDEO_META_JSON]
 WEB_FALLBACK = os.getenv("WEB_FALLBACK","true").strip().lower() in {"1","true","yes","on"}
 
-# ------------ Trusted domains ------------
+# ---------------- Trusted domains ----------------
 TRUSTED_DOMAINS = [
     "nih.gov","medlineplus.gov","cdc.gov","mayoclinic.org","health.harvard.edu",
     "familydoctor.org","healthfinder.gov","ama-assn.org","medicalxpress.com",
     "sciencedaily.com","nejm.org","med.stanford.edu","icahn.mssm.edu"
 ]
 
-# ------------ Experts allow-list + synonyms ------------
+# ---------------- Experts allow-list + synonyms ----------------
 ALLOWED_CREATORS = [
     "Dr. Pradip Jamnadas, MD",
     "Andrew Huberman",
@@ -84,8 +85,9 @@ CREATOR_SYNONYMS = {
     "the diary of a ceo": "The Diary of A CEO",
 }
 
-# ------------ Utils ------------
-def _normalize_text(s:str)->str: return re.sub(r"\s+"," ",(s or "").strip())
+# ---------------- Small utils ----------------
+def _normalize_text(s:str)->str:
+    return re.sub(r"\s+"," ",(s or "").strip())
 
 def _parse_ts(v)->float:
     if isinstance(v,(int,float)):
@@ -120,7 +122,7 @@ def _clear_chat():
     st.session_state["messages"]=[]
     st.rerun()
 
-# ------------ Admin gate ------------
+# ---------------- Admin gate ----------------
 def _is_admin()->bool:
     try: qp = st.query_params
     except Exception: return False
@@ -130,7 +132,7 @@ def _is_admin()->bool:
     if expected is None: return True
     return qp.get("key","")==str(expected)
 
-# ------------ Creator normalization ------------
+# ---------------- Creator normalization ----------------
 def canonicalize_creator(name: str) -> str | None:
     n = (name or "").strip()
     if not n: return None
@@ -146,7 +148,7 @@ def canonicalize_creator(name: str) -> str | None:
             return canon
     return None
 
-# ------------ Loaders ------------
+# ---------------- Loaders ----------------
 @st.cache_data(show_spinner=False, hash_funcs={Path:_file_mtime})
 def load_video_meta()->Dict[str,Dict[str,Any]]:
     if VIDEO_META_JSON.exists():
@@ -199,7 +201,7 @@ def precompute_status(embedder_model:str)->Dict[str,Any]:
         status["msg"].append(f"precompute check error: {e}")
     return status
 
-# ------------ JSONL offsets ------------
+# ---------------- JSONL offsets ----------------
 def _ensure_offsets()->np.ndarray:
     if OFFSETS_NPY.exists():
         try:
@@ -227,7 +229,7 @@ def iter_jsonl_rows(indices:List[int], limit:int|None=None):
             try: yield i, json.loads(raw)
             except: continue
 
-# ------------ Model + FAISS ------------
+# ---------------- Model + FAISS ----------------
 @st.cache_resource(show_spinner=False)
 def _load_embedder(model_name:str)->SentenceTransformer:
     return SentenceTransformer(model_name, device="cpu")
@@ -244,7 +246,7 @@ def load_metas_and_model(index_path:Path=INDEX_PATH, metas_path:Path=METAS_PKL):
     try_name = str(local_dir) if (local_dir/"config.json").exists() else model_name
     embedder = _load_embedder(try_name)
     if index.d != embedder.get_sentence_embedding_dimension():
-        raise RuntimeError(f"Embedding dim mismatch: FAISS={index.d} vs Encoder={embedder.get_sentence_embedding_dimension()}. Rebuild with model '{model_name}'.")
+        raise RuntimeError(f"Embedding dim mismatch: FAISS={index.d} vs Encoder={embedder.get_sentence_embedding_dimension()}. Rebuild.")
     return index, metas_from_pkl, {"model_name":try_name, "embedder":embedder}
 
 @st.cache_resource(show_spinner=False)
@@ -262,7 +264,7 @@ def load_video_summaries():
         except:return {}
     return {}
 
-# ------------ Diversity (MMR) ------------
+# ---------------- Diversity (MMR) ----------------
 def mmr(qv:np.ndarray, doc_vecs:np.ndarray, k:int, lambda_diversity:float=0.45)->List[int]:
     if doc_vecs.size==0: return []
     sim=(doc_vecs @ qv.reshape(-1,1)).ravel()
@@ -289,7 +291,7 @@ def _dedupe_passages(items:List[Dict[str,Any]], time_window_sec:float=8.0, min_c
         seen.append(h); out.append(h)
     return out
 
-# ------------ Summary-aware routing ------------
+# ---------------- Summary-aware routing ----------------
 def _build_idf_over_bullets(summaries: dict) -> dict:
     import math, collections
     DF = collections.Counter()
@@ -336,7 +338,7 @@ def route_videos_by_summary(
     scored.sort(key=lambda x:-x[1])
     return [v for v,_ in scored[:int(topK)]]
 
-# ------------ Stage B search ------------
+# ---------------- Stage B search ----------------
 def stageB_search_chunks(query:str,
     index:faiss.Index, embedder:SentenceTransformer,
     candidate_vids:Set[str] | None,
@@ -398,7 +400,7 @@ def stageB_search_chunks(query:str,
         if len(picked)>=int(final_k): break
     return picked
 
-# ------------ Grouped evidence ------------
+# ---------------- Grouped evidence ----------------
 def group_hits_by_video(hits:List[Dict[str,Any]])->Dict[str,List[Dict[str,Any]]]:
     g={}
     for h in hits:
@@ -434,7 +436,7 @@ def build_grouped_evidence_for_prompt(hits:List[Dict[str,Any]], vm:dict, summari
         lines.append("")
     return "\n".join(lines).strip()
 
-# ------------ Web fetch ------------
+# ---------------- Web fetch ----------------
 def _ddg_domain_search(domain:str, query:str, headers:dict, timeout:float):
     try:
         r=requests.get("https://duckduckgo.com/html/", params={"q":f"site:{domain} {query}"}, headers=headers, timeout=timeout)
@@ -465,7 +467,7 @@ def fetch_trusted_snippets(query:str, allowed_domains:List[str], max_snippets:in
         if len(out)>=max_snippets: break
     return out[:max_snippets]
 
-# ------------ LLM ------------
+# ---------------- LLM ----------------
 def openai_answer(model_name:str, question:str, history:List[Dict[str,str]], grouped_video_block:str, web_snips:List[Dict[str,str]], no_video:bool)->str:
     if not os.getenv("OPENAI_API_KEY"): return "⚠️ OPENAI_API_KEY is not set."
     recent=history[-6:]; convo=[]
@@ -492,17 +494,16 @@ def openai_answer(model_name:str, question:str, history:List[Dict[str,str]], gro
         "Rules:\n"
         "• Cite every claim/step: (Video k) for videos, (DOMAIN Wj) for web.\n"
         "• Prefer human clinical data; label animal/in-vitro/mechanistic explicitly.\n"
-        "• Normalize units and report numeric effect sizes when sources provide them (%, mg/dL, mmol/L, ApoB concentration). "
+        "• Normalize units and report numeric effect sizes when sources provide them (%, mg/dL, mmol/L, ApoB). "
         "If ranges disagree, state both and indicate higher-quality evidence.\n"
-        "• list therapeutic OPTIONS by class and drug names mentioned in videos and trusted sites "
-        "(e.g., statins, ezetimibe, PCSK9, etc if discussed). "
-        "Include mechanism and typical magnitude of change when stated; if dose not provided, write 'dose not specified'. No diagnosis.\n"
+        "• List therapeutic OPTIONS by class and drug names from videos/web; include mechanism and typical magnitude; "
+        "if dose missing, write 'dose not specified'. No diagnosis.\n"
         "Structure:\n"
-        "• Key summary — specific, robust, detailed, source-grounded, with numbers when available\n"
-        "• Practical protocol — numbered, stepwise, actionable; include recommendations and steps\n"
+        "• Key summary — specific, detailed, source-grounded, with numbers when available\n"
+        "• Practical protocol — numbered, stepwise, actionable\n"
         "• Safety notes — contraindications, interactions, and when to consult a clinician\n"
         "Output must be concise, uncertainty labeled, and free of speculation.\n"
-        "Use only quoted bullets and chunk quotes from the evidence blocks; do not invent new claims."
+        "Use only quoted bullets and chunk quotes; do not invent claims."
     )
 
     user_payload=((("Recent conversation:\n"+"\n".join(convo)+"\n\n") if convo else "")
@@ -521,7 +522,7 @@ def openai_answer(model_name:str, question:str, history:List[Dict[str,str]], gro
     except Exception as e:
         return f"⚠️ Generation error: {e}"
 
-# ------------ Precompute runners ------------
+# ---------------- Precompute runners + repairs ----------------
 def _run_precompute_inline()->str:
     try:
         try:
@@ -542,7 +543,6 @@ def _run_precompute_inline()->str:
         return f"precompute error: {e}"
 
 def _repair_centroids_in_place()->str:
-    """Ensure centroids are unit-norm. Renormalizes file in place."""
     try:
         if not VID_CENT_NPY.exists(): return "centroids file missing"
         C = np.load(VID_CENT_NPY).astype("float32")
@@ -554,6 +554,66 @@ def _repair_centroids_in_place()->str:
     except Exception as e:
         return f"repair error: {e}"
 
+def _build_summaries_fallback(max_lines_per_video: int = 800) -> str:
+    """Create video_summaries.json directly from chunks.jsonl (light TF-IDF bullets)."""
+    try:
+        if not CHUNKS_PATH.exists(): return "chunks.jsonl missing"
+        vm = load_video_meta()
+
+        texts_by_vid: Dict[str, List[str]] = {}
+        ts_by_vid: Dict[str, List[float]] = {}
+        with CHUNKS_PATH.open(encoding="utf-8") as f:
+            for ln in f:
+                try: j = json.loads(ln)
+                except: continue
+                t = _normalize_text(j.get("text",""))
+                m = (j.get("meta") or {})
+                vid = (m.get("video_id") or m.get("vid") or m.get("ytid") or
+                       j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id"))
+                if not vid or not t: continue
+                ts = _parse_ts(m.get("start", m.get("start_sec", 0)))
+                texts_by_vid.setdefault(vid, []).append(t)
+                ts_by_vid.setdefault(vid, []).append(float(ts))
+
+        vids = list(texts_by_vid.keys())
+        if not vids: return "no videos detected in chunks.jsonl"
+
+        import math, collections
+        DF = collections.Counter()
+        for vid in vids:
+            seen=set()
+            for t in texts_by_vid[vid]:
+                for w in set(t.lower().split()):
+                    if w not in seen:
+                        DF[w]+=1; seen.add(w)
+        N = max(1,len(vids))
+        def score_line(t:str)->float:
+            words=t.lower().split()
+            tf=collections.Counter(words)
+            return sum(tf[w]*math.log((N+1)/(DF.get(w,1)+0.5)) for w in tf)/(len(words)+1e-6)
+
+        summaries={}
+        for vid in vids:
+            lines=texts_by_vid[vid][:max_lines_per_video]
+            times=ts_by_vid[vid][:max_lines_per_video]
+            idx_scores=[(i,score_line(t)) for i,t in enumerate(lines)]
+            top=sorted([i for i,_ in sorted(idx_scores,key=lambda x:-x[1])[:12]])[:10]
+            bullets=[{"ts":float(times[i]),
+                      "text":(lines[i][:280]+"…" if len(lines[i])>280 else lines[i])} for i in top[:6]]
+            summary=" ".join(lines[i] for i in top[:6])
+            if len(summary)>1200: summary=summary[:1200]+"…"
+            info=vm.get(vid,{})
+            summaries[vid]={"title":info.get("title",""),
+                            "channel":info.get("channel",""),
+                            "published_at":info.get("published_at") or info.get("publishedAt") or info.get("date") or "",
+                            "bullets":bullets,"summary":summary}
+
+        VID_SUM_JSON.parent.mkdir(parents=True, exist_ok=True)
+        VID_SUM_JSON.write_text(json.dumps(summaries, ensure_ascii=False, indent=2), encoding="utf-8")
+        return f"ok: wrote {VID_SUM_JSON}"
+    except Exception as e:
+        return f"summaries fallback error: {e}"
+
 def _path_exists_report()->Dict[str, Any]:
     return {
         "DATA_DIR": str(DATA_ROOT),
@@ -563,7 +623,7 @@ def _path_exists_report()->Dict[str, Any]:
         "summaries": str(VID_SUM_JSON), "summaries_exists": VID_SUM_JSON.exists(),
     }
 
-# ------------ Verification helper (admin) ------------
+# ---------------- Verification helper (admin) ----------------
 def scan_chunks_for_terms(terms:List[str], vm:Dict[str,Dict[str,Any]], limit_examples:int=200):
     if not CHUNKS_PATH.exists():
         return {"total_matches":0,"per_creator":{},"examples":[]}
@@ -589,7 +649,7 @@ def scan_chunks_for_terms(terms:List[str], vm:Dict[str,Dict[str,Any]], limit_exa
     per_creator=dict(sorted(per_creator.items(), key=lambda kv:-kv[1]))
     return {"total_matches":total,"per_creator":per_creator,"examples":examples}
 
-# ============ UI ============
+# ================= UI =================
 st.set_page_config(page_title="Longevity / Nutrition Q&A", page_icon="🍎", layout="wide")
 st.title("Longevity / Nutrition Q&A")
 
@@ -616,7 +676,7 @@ with st.sidebar:
     half_life = st.slider("Recency half-life (days)", 7, 720, 270, 7,
         help="After this many days, recency value halves.")
 
-    # Experts vertical list with counts
+    # Experts with counts
     vm = load_video_meta()
     counts={canon:0 for canon in ALLOWED_CREATORS}
     for vid in vm:
@@ -633,7 +693,7 @@ with st.sidebar:
             selected_creators_list.append(canon)
     selected_creators:set[str]=set(selected_creators_list)
 
-    # Trusted sites vertical list
+    # Trusted sites
     st.subheader("Trusted sites")
     st.caption("Short, reliable excerpts that support expert videos.")
     allow_web = st.checkbox(
@@ -663,7 +723,7 @@ with st.sidebar:
     st.checkbox("metas.pkl present", value=METAS_PKL.exists(), disabled=True)
     st.checkbox("video_meta.json present", value=VIDEO_META_JSON.exists(), disabled=True)
     cent_ready = VID_CENT_NPY.exists() and VID_IDS_TXT.exists() and VID_SUM_JSON.exists()
-    st.caption("Video centroids/summaries: ready" if cent_ready else "Precompute not found. Click rebuild in admin.")
+    st.caption("Video centroids/summaries: ready" if cent_ready else "Precompute not found. Use admin tools.")
 
 if show_diag:
     colA,colB,colC = st.columns([2,3,3])
@@ -715,7 +775,7 @@ if _is_admin():
         st.metric("ids newer than chunks", "Yes" if ok_ids else "No")
         st.caption(f"ids: {_iso(ids_m)}  |  chunks: {_iso(chunks_m)}")
     if not (ok_cent and ok_ids):
-        st.warning("Centroids/IDs are older than chunks.jsonl. Click **Rebuild precompute (admin)**.")
+        st.warning("Centroids/IDs are older than chunks.jsonl. Use rebuild below.")
 
     st.markdown("---")
     st.subheader("Files on disk (debug)")
@@ -727,18 +787,20 @@ if _is_admin():
         if st.button("Rebuild precompute (admin)"):
             with st.spinner("Building centroids and summaries…"):
                 msg=_run_precompute_inline()
-            st.success(str(msg))
-            st.cache_resource.clear(); st.cache_data.clear(); st.rerun()
+            st.success(str(msg)); st.cache_resource.clear(); st.cache_data.clear(); st.rerun()
     with cols_dbg[1]:
         if st.button("Repair centroids norms"):
             with st.spinner("Renormalizing centroids…"):
                 msg=_repair_centroids_in_place()
-            st.success(msg)
-            st.cache_resource.clear(); st.cache_data.clear(); st.rerun()
+            st.success(msg); st.cache_resource.clear(); st.cache_data.clear(); st.rerun()
     with cols_dbg[2]:
         st.caption(f"summaries path: {VID_SUM_JSON}")
+        if st.button("Build summaries now (fallback)"):
+            with st.spinner("Generating summaries from chunks.jsonl…"):
+                msg=_build_summaries_fallback()
+            st.success(msg); st.cache_resource.clear(); st.cache_data.clear(); st.rerun()
         if not VID_SUM_JSON.exists():
-            st.warning("Summaries missing. Rebuild precompute.")
+            st.warning("Summaries missing. Use rebuild or fallback.")
 
     st.markdown("---")
     st.caption("Keyword coverage scan (verification only).")
