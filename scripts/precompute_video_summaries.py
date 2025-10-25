@@ -1,13 +1,22 @@
 # scripts/precompute_video_summaries.py
-# Build per-video centroids + concise summaries from chunks.jsonl
+# Build high-quality, extractive per-video bullets + centroids.
+#
 # Outputs:
-#   /var/data/data/index/video_centroids.npy      (float32 [V, d])
+#   /var/data/data/index/video_centroids.npy      (float32 [V, d], unit-norm)
 #   /var/data/data/index/video_ids.txt            (one video_id per line)
-#   /var/data/data/catalog/video_summaries.json   ({vid:{title,channel,date,summary,claims:[{ts,text}]}})
+#   /var/data/data/catalog/video_summaries.json   ({
+#       vid:{
+#         title, channel, published_at,
+#         bullets:[{ts, text, chunk_idx, span}],
+#         key_terms:[...],
+#         metrics:{coverage, redundancy, n_bullets}
+#       }
+#   })
+#
 # Run:
 #   DATA_DIR=/var/data python scripts/precompute_video_summaries.py
 
-import os, json, math, pickle
+import os, json, math, pickle, re
 from pathlib import Path
 from collections import defaultdict, Counter
 
@@ -22,6 +31,8 @@ OUT_IDS  = DATA_ROOT / "data/index/video_ids.txt"
 OUT_SUM  = DATA_ROOT / "data/catalog/video_summaries.json"
 METAS_PKL= DATA_ROOT / "data/index/metas.pkl"
 
+SENT_SPLIT = re.compile(r'(?<=[\.\!\?])\s+')  # simple sentence split
+
 def _parse_ts(v):
     if isinstance(v,(int,float)): return float(v)
     try:
@@ -34,6 +45,22 @@ def _parse_ts(v):
 def normalize(s): 
     return " ".join((s or "").split())
 
+def sent_tokenize(text: str):
+    text = normalize(text)
+    if not text: return []
+    parts = SENT_SPLIT.split(text)
+    # strip empties, keep only reasonable sentences
+    return [p.strip() for p in parts if len(p.strip()) >= 20]
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b: return 0.0
+    return len(a & b) / max(1, len(a | b))
+
+def _unit_norm(X: np.ndarray) -> np.ndarray:
+    X = X.astype("float32")
+    n = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
+    return X / n
+
 def main():
     assert CHUNKS.exists(), f"missing {CHUNKS}"
     vm = {}
@@ -41,7 +68,7 @@ def main():
         try: vm = json.loads(VIDEO_META.read_text(encoding="utf-8"))
         except: vm = {}
 
-    # pick model name from metas.pkl to stay aligned
+    # pick model from metas.pkl to stay aligned with index
     model_name = "sentence-transformers/all-MiniLM-L6-v2"
     if METAS_PKL.exists():
         try:
@@ -55,16 +82,19 @@ def main():
     try_name = str(local_dir) if (local_dir/"config.json").exists() else model_name
     enc = SentenceTransformer(try_name, device="cpu")
 
-    # 1) load chunks grouped by video
-    texts_by_vid = defaultdict(list)
-    metas_by_vid = defaultdict(list)
+    # 1) load chunks grouped by video; also build raw corpus for DF
+    texts_by_vid = defaultdict(list)       # per-video list of chunk texts
+    metas_by_vid = defaultdict(list)       # per-video list of {"start": float}
     with CHUNKS.open(encoding="utf-8") as f:
         for ln in f:
             j=json.loads(ln)
             t = normalize(j.get("text",""))
             m = (j.get("meta") or {})
-            vid = m.get("video_id") or m.get("vid") or m.get("ytid") or j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id")
-            if not vid or not t: 
+            vid = (
+                m.get("video_id") or m.get("vid") or m.get("ytid") or
+                j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id")
+            )
+            if not vid or not t:
                 continue
             st = _parse_ts(m.get("start", m.get("start_sec", 0)))
             texts_by_vid[vid].append(t)
@@ -74,69 +104,174 @@ def main():
     if not vids:
         raise SystemExit("No videos found in chunks.jsonl")
 
-    # 2) centroid per video (mean of normalized chunk embeddings)
+    # 2) compute chunk embeddings and video centroids (mean of unit-norm chunks)
     centroids = []
+    chunk_embeds_by_vid = {}
     for vid in vids:
-        X = enc.encode(texts_by_vid[vid], normalize_embeddings=True, batch_size=128).astype("float32")
+        chunks = texts_by_vid[vid]
+        X = enc.encode(chunks, normalize_embeddings=True, batch_size=128).astype("float32")
+        chunk_embeds_by_vid[vid] = X
         c = X.mean(axis=0)
-        # re-normalize centroid for cosine
         c = c / (np.linalg.norm(c) + 1e-12)
         centroids.append(c)
     C = np.stack(centroids).astype("float32")
+    OUT_CENT.parent.mkdir(parents=True, exist_ok=True)
     np.save(OUT_CENT, C)
     OUT_IDS.write_text("\n".join(vids), encoding="utf-8")
 
-    # 3) simple per-video summary + top claims (light TF-IDF on words)
-    # build corpus DF
+    # 3) sentence-level extractive bullets per video
+    # Build DF over words (per-video, sentence-aware)
     DF = Counter()
     for vid in vids:
         seen = set()
-        for t in texts_by_vid[vid]:
-            toks = set(w.lower() for w in t.split())
-            for w in toks:
-                DF[w] += 1
-    N = len(vids)
+        for chunk in texts_by_vid[vid]:
+            for sent in sent_tokenize(chunk):
+                for w in set(sent.lower().split()):
+                    if w in seen: continue
+                    DF[w] += 1
+                    seen.add(w)
+    N_videos = max(1, len(vids))
 
-    def score_text(t):
-        words = [w.lower() for w in t.split()]
+    def tfidf_sentence(sent: str) -> float:
+        words = [w for w in sent.lower().split() if w]
         tf = Counter(words)
         val=0.0
         for w,cnt in tf.items():
             df = DF.get(w,1)
-            idf = math.log((N+1)/(df+0.5))
+            idf = math.log((N_videos+1)/(df+0.5))
             val += cnt * idf
         return val / (len(words)+1e-6)
 
     summaries = {}
-    for vid in vids:
+    for v_idx, vid in enumerate(vids):
         info = vm.get(vid,{})
-        # pick 6 high-scoring lines across the video as pseudo-summary
-        lines = texts_by_vid[vid]
-        scores = [(i, score_text(t)) for i,t in enumerate(lines)]
-        top = [i for i,_ in sorted(scores, key=lambda x: -x[1])[:12]]  # 12 raw
-        # keep diversity by ordering by position
-        top_sorted = sorted(top[:10])  # keep <=10
-        # build claims as (ts,text) of first 6
-        claims=[]
-        for i in top_sorted[:6]:
-            claims.append({
-                "ts": float(metas_by_vid[vid][i]["start"]),
-                "text": lines[i][:280]+"…" if len(lines[i])>280 else lines[i]
+        title = info.get("title") or ""
+        channel = info.get("channel") or info.get("podcaster") or ""
+        pub = info.get("published_at") or info.get("publishedAt") or info.get("date") or ""
+
+        # sentence candidates with timestamps (approx by source chunk start)
+        sentences = []
+        chunk_list = texts_by_vid[vid]
+        for i_chunk, chunk in enumerate(chunk_list):
+            start_ts = metas_by_vid[vid][i_chunk]["start"]
+            for sent in sent_tokenize(chunk):
+                sentences.append({
+                    "text": sent,
+                    "ts": float(start_ts),
+                    "chunk_idx": i_chunk
+                })
+
+        if not sentences:
+            summaries[vid] = {
+                "title": title, "channel": channel, "published_at": pub,
+                "bullets": [], "key_terms": [], "metrics": {"coverage":0.0, "redundancy":0.0, "n_bullets":0}
+            }
+            continue
+
+        # embed sentences for cosine-to-centroid and novelty
+        S_txt = [s["text"] for s in sentences]
+        S_emb = enc.encode(S_txt, normalize_embeddings=True, batch_size=128)
+        c = C[v_idx].reshape(1, -1)
+        cos = (S_emb @ c.T).ravel()
+
+        # score sentences: TF-IDF + cosine + position prior (earlier, repeated ideas up)
+        # position prior: earlier ts → slightly higher; transform to [0..1] with exp decay
+        ts_all = np.array([s["ts"] for s in sentences], dtype="float32")
+        if len(ts_all)>0:
+            tmax = max(1.0, float(ts_all.max()))
+            pos_prior = np.exp(-ts_all / (0.25*tmax))  # 0.25 video-length half-life
+        else:
+            pos_prior = np.ones(len(sentences), dtype="float32")
+
+        tfidf_vals = np.array([tfidf_sentence(s["text"]) for s in sentences], dtype="float32")
+        raw_score = 0.45*tfidf_vals + 0.45*cos + 0.10*pos_prior
+
+        # MMR-style selection with diversity and time de-duplication
+        keep = []
+        keep_emb = []
+        keep_times = []
+        time_window = 15.0     # seconds
+        sim_thresh = 0.85      # cosine
+        jac_thresh = 0.60      # token jaccard
+
+        order = list(np.argsort(-raw_score))
+        for idx in order:
+            s = sentences[idx]
+            e = S_emb[idx]
+            t = s["ts"]
+            words = set(s["text"].lower().split())
+
+            # time near-duplicate?
+            duplicate = False
+            for j, (ke, kt, ks) in enumerate(zip(keep_emb, keep_times, keep)):
+                if abs(t-kt) <= time_window:
+                    cos_sim = float(np.dot(e, ke))
+                    if cos_sim >= sim_thresh:
+                        duplicate = True; break
+                    if _jaccard(words, set(ks["text"].lower().split())) >= jac_thresh:
+                        duplicate = True; break
+            if duplicate: 
+                continue
+
+            keep.append(s)
+            keep_emb.append(e)
+            keep_times.append(t)
+            if len(keep) >= 10:   # cap bullets
+                break
+
+        # sort bullets by time
+        keep_sorted = sorted(keep, key=lambda x: x["ts"])
+
+        # metrics: redundancy (mean max sim among bullets), coverage (fraction tfidf mass kept)
+        redundancy = 0.0
+        if len(keep_emb) > 1:
+            E = np.vstack(keep_emb)
+            sims = E @ E.T
+            np.fill_diagonal(sims, 0.0)
+            redundancy = float(np.mean(np.max(sims, axis=1)))
+
+        kept_idx = [S_txt.index(k["text"]) for k in keep_sorted]
+        coverage = float(tfidf_vals[kept_idx].sum() / (tfidf_vals.sum()+1e-9))
+
+        # key terms (top IDF contributors across kept bullets)
+        term_counter = Counter()
+        for b in keep_sorted:
+            for w in set(b["text"].lower().split()):
+                term_counter[w] += 1
+        key_terms = [w for w,_ in term_counter.most_common(12)]
+
+        # attach spans: locate sentence inside its chunk text
+        bullets=[]
+        for b in keep_sorted:
+            ci = b["chunk_idx"]
+            chunk_text = chunk_list[ci]
+            text = b["text"]
+            # find span; if multiple matches, take first
+            start = chunk_text.find(text)
+            span = [start, start+len(text)] if start >= 0 else [-1, -1]
+            bullets.append({
+                "ts": float(b["ts"]),
+                "text": text,
+                "chunk_idx": int(ci),
+                "span": span
             })
-        # make a compact summary from first 6 top lines
-        summary = " ".join(lines[i] for i in top_sorted[:6])
-        if len(summary) > 1200:
-            summary = summary[:1200]+"…"
+
         summaries[vid] = {
-            "title": info.get("title") or "",
-            "channel": info.get("channel") or "",
-            "published_at": info.get("published_at") or info.get("publishedAt") or info.get("date") or "",
-            "summary": summary,
-            "claims": claims
+            "title": title,
+            "channel": channel,
+            "published_at": pub,
+            "bullets": bullets,
+            "key_terms": key_terms,
+            "metrics": {
+                "coverage": round(coverage,4),
+                "redundancy": round(redundancy,4),
+                "n_bullets": len(bullets)
+            }
         }
 
+    OUT_SUM.parent.mkdir(parents=True, exist_ok=True)
     OUT_SUM.write_text(json.dumps(summaries, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("Wrote:", OUT_CENT, OUT_IDS, OUT_SUM)
+    print(f"Wrote: {OUT_CENT}, {OUT_IDS}, {OUT_SUM}  (videos={len(vids)})")
 
 if __name__ == "__main__":
     main()
