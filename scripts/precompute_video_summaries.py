@@ -31,7 +31,7 @@ OUT_IDS  = DATA_ROOT / "data/index/video_ids.txt"
 OUT_SUM  = DATA_ROOT / "data/catalog/video_summaries.json"
 METAS_PKL= DATA_ROOT / "data/index/metas.pkl"
 
-SENT_SPLIT = re.compile(r'(?<=[\.\!\?])\s+')  # simple sentence split
+SENT_SPLIT = re.compile(r'(?<=[\.\!\?])\s+')
 
 def _parse_ts(v):
     if isinstance(v,(int,float)): return float(v)
@@ -49,17 +49,11 @@ def sent_tokenize(text: str):
     text = normalize(text)
     if not text: return []
     parts = SENT_SPLIT.split(text)
-    # strip empties, keep only reasonable sentences
     return [p.strip() for p in parts if len(p.strip()) >= 20]
 
 def _jaccard(a: set, b: set) -> float:
     if not a or not b: return 0.0
     return len(a & b) / max(1, len(a | b))
-
-def _unit_norm(X: np.ndarray) -> np.ndarray:
-    X = X.astype("float32")
-    n = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
-    return X / n
 
 def main():
     assert CHUNKS.exists(), f"missing {CHUNKS}"
@@ -68,7 +62,7 @@ def main():
         try: vm = json.loads(VIDEO_META.read_text(encoding="utf-8"))
         except: vm = {}
 
-    # pick model from metas.pkl to stay aligned with index
+    # align encoder with FAISS model
     model_name = "sentence-transformers/all-MiniLM-L6-v2"
     if METAS_PKL.exists():
         try:
@@ -77,14 +71,13 @@ def main():
             model_name = payload.get("model", model_name)
         except: pass
 
-    # Prefer local cached model if present
     local_dir = DATA_ROOT / "models" / "all-MiniLM-L6-v2"
     try_name = str(local_dir) if (local_dir/"config.json").exists() else model_name
     enc = SentenceTransformer(try_name, device="cpu")
 
-    # 1) load chunks grouped by video; also build raw corpus for DF
-    texts_by_vid = defaultdict(list)       # per-video list of chunk texts
-    metas_by_vid = defaultdict(list)       # per-video list of {"start": float}
+    # 1) load chunks grouped by video
+    texts_by_vid = defaultdict(list)
+    metas_by_vid = defaultdict(list)
     with CHUNKS.open(encoding="utf-8") as f:
         for ln in f:
             j=json.loads(ln)
@@ -104,7 +97,7 @@ def main():
     if not vids:
         raise SystemExit("No videos found in chunks.jsonl")
 
-    # 2) compute chunk embeddings and video centroids (mean of unit-norm chunks)
+    # 2) centroids (mean of unit-normalized chunk embeddings)
     centroids = []
     chunk_embeds_by_vid = {}
     for vid in vids:
@@ -119,8 +112,8 @@ def main():
     np.save(OUT_CENT, C)
     OUT_IDS.write_text("\n".join(vids), encoding="utf-8")
 
-    # 3) sentence-level extractive bullets per video
-    # Build DF over words (per-video, sentence-aware)
+    # 3) sentence-level extractive bullets
+    # DF over words across videos
     DF = Counter()
     for vid in vids:
         seen = set()
@@ -149,17 +142,13 @@ def main():
         channel = info.get("channel") or info.get("podcaster") or ""
         pub = info.get("published_at") or info.get("publishedAt") or info.get("date") or ""
 
-        # sentence candidates with timestamps (approx by source chunk start)
+        # candidate sentences with timestamps (from chunk start)
         sentences = []
         chunk_list = texts_by_vid[vid]
         for i_chunk, chunk in enumerate(chunk_list):
             start_ts = metas_by_vid[vid][i_chunk]["start"]
             for sent in sent_tokenize(chunk):
-                sentences.append({
-                    "text": sent,
-                    "ts": float(start_ts),
-                    "chunk_idx": i_chunk
-                })
+                sentences.append({"text": sent, "ts": float(start_ts), "chunk_idx": i_chunk})
 
         if not sentences:
             summaries[vid] = {
@@ -168,61 +157,52 @@ def main():
             }
             continue
 
-        # embed sentences for cosine-to-centroid and novelty
+        # embed sentences to score with centroid and novelty
         S_txt = [s["text"] for s in sentences]
         S_emb = enc.encode(S_txt, normalize_embeddings=True, batch_size=128)
         c = C[v_idx].reshape(1, -1)
         cos = (S_emb @ c.T).ravel()
 
-        # score sentences: TF-IDF + cosine + position prior (earlier, repeated ideas up)
-        # position prior: earlier ts → slightly higher; transform to [0..1] with exp decay
+        # position prior: earlier sentences get mild boost
         ts_all = np.array([s["ts"] for s in sentences], dtype="float32")
         if len(ts_all)>0:
             tmax = max(1.0, float(ts_all.max()))
-            pos_prior = np.exp(-ts_all / (0.25*tmax))  # 0.25 video-length half-life
+            pos_prior = np.exp(-ts_all / (0.25*tmax))
         else:
             pos_prior = np.ones(len(sentences), dtype="float32")
 
         tfidf_vals = np.array([tfidf_sentence(s["text"]) for s in sentences], dtype="float32")
         raw_score = 0.45*tfidf_vals + 0.45*cos + 0.10*pos_prior
 
-        # MMR-style selection with diversity and time de-duplication
+        # MMR-like selection + time/window dedup
         keep = []
         keep_emb = []
         keep_times = []
-        time_window = 15.0     # seconds
-        sim_thresh = 0.85      # cosine
-        jac_thresh = 0.60      # token jaccard
+        time_window = 15.0
+        sim_thresh = 0.85
+        jac_thresh = 0.60
 
         order = list(np.argsort(-raw_score))
         for idx in order:
-            s = sentences[idx]
-            e = S_emb[idx]
-            t = s["ts"]
+            s = sentences[idx]; e = S_emb[idx]; t = s["ts"]
             words = set(s["text"].lower().split())
 
-            # time near-duplicate?
             duplicate = False
-            for j, (ke, kt, ks) in enumerate(zip(keep_emb, keep_times, keep)):
+            for ke, kt, ks in zip(keep_emb, keep_times, keep):
                 if abs(t-kt) <= time_window:
-                    cos_sim = float(np.dot(e, ke))
-                    if cos_sim >= sim_thresh:
+                    if float(np.dot(e, ke)) >= sim_thresh:
                         duplicate = True; break
                     if _jaccard(words, set(ks["text"].lower().split())) >= jac_thresh:
                         duplicate = True; break
             if duplicate: 
                 continue
 
-            keep.append(s)
-            keep_emb.append(e)
-            keep_times.append(t)
-            if len(keep) >= 10:   # cap bullets
-                break
+            keep.append(s); keep_emb.append(e); keep_times.append(t)
+            if len(keep) >= 10: break
 
-        # sort bullets by time
         keep_sorted = sorted(keep, key=lambda x: x["ts"])
 
-        # metrics: redundancy (mean max sim among bullets), coverage (fraction tfidf mass kept)
+        # metrics
         redundancy = 0.0
         if len(keep_emb) > 1:
             E = np.vstack(keep_emb)
@@ -233,20 +213,19 @@ def main():
         kept_idx = [S_txt.index(k["text"]) for k in keep_sorted]
         coverage = float(tfidf_vals[kept_idx].sum() / (tfidf_vals.sum()+1e-9))
 
-        # key terms (top IDF contributors across kept bullets)
+        # key terms over kept bullets
         term_counter = Counter()
         for b in keep_sorted:
             for w in set(b["text"].lower().split()):
                 term_counter[w] += 1
         key_terms = [w for w,_ in term_counter.most_common(12)]
 
-        # attach spans: locate sentence inside its chunk text
+        # spans inside the source chunk
         bullets=[]
         for b in keep_sorted:
             ci = b["chunk_idx"]
             chunk_text = chunk_list[ci]
             text = b["text"]
-            # find span; if multiple matches, take first
             start = chunk_text.find(text)
             span = [start, start+len(text)] if start >= 0 else [-1, -1]
             bullets.append({
@@ -262,11 +241,7 @@ def main():
             "published_at": pub,
             "bullets": bullets,
             "key_terms": key_terms,
-            "metrics": {
-                "coverage": round(coverage,4),
-                "redundancy": round(redundancy,4),
-                "n_bullets": len(bullets)
-            }
+            "metrics": {"coverage": round(coverage,4), "redundancy": round(redundancy,4), "n_bullets": len(bullets)}
         }
 
     OUT_SUM.parent.mkdir(parents=True, exist_ok=True)
