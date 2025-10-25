@@ -3,16 +3,15 @@
 """
 Longevity / Nutrition Q&A — Experts-first RAG with trusted web support
 
-Behavior:
-- Route → then scan: rank all videos via bullets+centroid+recency, pick top 5, then search chunks only in those.
+Flow:
+- Route → then scan: rank videos by bullets+centroid+recency; pick top 5; search chunks only in those.
 - Extractive bullets with timestamps; answers cite videos (Video k) and web (DOMAIN Wj).
-- Experts and trusted sites: vertical checklists, all selected by default; per-expert counts; creator-name normalization.
-- Admin diagnostics: precompute rebuild, norms/dim checks, mtimes, freshness check, keyword scan; source JSON export.
+- Experts and trusted sites: vertical checklists, all selected by default; per-expert counts; creator normalization.
+- Admin: precompute rebuild, norms/dim checks, mtimes, freshness check, keyword scan, file-path debug, centroid-norm repair.
 """
 
 from __future__ import annotations
 
-# Quiet noisy libs
 import os
 os.environ.setdefault("TOKENIZERS_PARALLELISM","false")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY","1")
@@ -30,7 +29,7 @@ import faiss
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
-# Optional web fetch deps (safe fail)
+# Optional web fetch
 try:
     import requests
     from bs4 import BeautifulSoup
@@ -114,10 +113,8 @@ def _file_mtime(p:Path)->float:
     except:return 0.0
 
 def _iso(ts: float) -> str:
-    try:
-        return datetime.fromtimestamp(ts).isoformat()
-    except Exception:
-        return "n/a"
+    try: return datetime.fromtimestamp(ts).isoformat()
+    except Exception: return "n/a"
 
 def _clear_chat():
     st.session_state["messages"]=[]
@@ -143,7 +140,6 @@ def canonicalize_creator(name: str) -> str | None:
     low = CREATOR_SYNONYMS.get(low, low)
     for canon in ALLOWED_CREATORS:
         if low == canon.lower(): return canon
-    # punct/space tolerant fallback
     strip_punct = re.sub(r"[^\w\s]", "", low)
     for canon in ALLOWED_CREATORS:
         if strip_punct == re.sub(r"[^\w\s]", "", canon.lower()):
@@ -367,7 +363,7 @@ def stageB_search_chunks(query:str,
         m["start"]=_parse_ts(m.get("start",0))
         if t:
             texts.append(t); metas.append(m)
-            keep.append((candidate_vids is None) or (vid in candidate_vids))  # empty set → keep False
+            keep.append((candidate_vids is None) or (vid in candidate_vids))
 
     if any(keep):
         texts=[t for t,k in zip(texts,keep) if k]
@@ -402,7 +398,7 @@ def stageB_search_chunks(query:str,
         if len(picked)>=int(final_k): break
     return picked
 
-# ------------ Grouped evidence (prefer bullets, then quotes) ------------
+# ------------ Grouped evidence ------------
 def group_hits_by_video(hits:List[Dict[str,Any]])->Dict[str,List[Dict[str,Any]]]:
     g={}
     for h in hits:
@@ -525,7 +521,7 @@ def openai_answer(model_name:str, question:str, history:List[Dict[str,str]], gro
     except Exception as e:
         return f"⚠️ Generation error: {e}"
 
-# ------------ Inline precompute (admin) ------------
+# ------------ Precompute runners ------------
 def _run_precompute_inline()->str:
     try:
         try:
@@ -545,6 +541,28 @@ def _run_precompute_inline()->str:
     except Exception as e:
         return f"precompute error: {e}"
 
+def _repair_centroids_in_place()->str:
+    """Ensure centroids are unit-norm. Renormalizes file in place."""
+    try:
+        if not VID_CENT_NPY.exists(): return "centroids file missing"
+        C = np.load(VID_CENT_NPY).astype("float32")
+        if C.ndim != 2 or C.size == 0: return "centroids shape invalid"
+        n = np.linalg.norm(C, axis=1, keepdims=True) + 1e-12
+        C = C / n
+        np.save(VID_CENT_NPY, C)
+        return "ok: renormalized"
+    except Exception as e:
+        return f"repair error: {e}"
+
+def _path_exists_report()->Dict[str, Any]:
+    return {
+        "DATA_DIR": str(DATA_ROOT),
+        "chunks": str(CHUNKS_PATH), "chunks_exists": CHUNKS_PATH.exists(),
+        "centroids": str(VID_CENT_NPY), "centroids_exists": VID_CENT_NPY.exists(),
+        "ids": str(VID_IDS_TXT), "ids_exists": VID_IDS_TXT.exists(),
+        "summaries": str(VID_SUM_JSON), "summaries_exists": VID_SUM_JSON.exists(),
+    }
+
 # ------------ Verification helper (admin) ------------
 def scan_chunks_for_terms(terms:List[str], vm:Dict[str,Dict[str,Any]], limit_examples:int=200):
     if not CHUNKS_PATH.exists():
@@ -560,7 +578,6 @@ def scan_chunks_for_terms(terms:List[str], vm:Dict[str,Dict[str,Any]], limit_exa
             m=(j.get("meta") or {})
             vid=m.get("video_id") or m.get("vid") or m.get("ytid") or j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id") or "Unknown"
             st_sec=_parse_ts(m.get("start", m.get("start_sec",0)))
-            info=vm.get(vid,{})
             creator=_raw_creator_of_vid(vid, vm)
             canon = canonicalize_creator(creator)
             label = canon if canon else creator
@@ -700,12 +717,28 @@ if _is_admin():
     if not (ok_cent and ok_ids):
         st.warning("Centroids/IDs are older than chunks.jsonl. Click **Rebuild precompute (admin)**.")
 
-    if st.button("Rebuild precompute (admin)"):
-        with st.spinner("Building centroids and summaries…"):
-            msg=_run_precompute_inline()
-        st.success(str(msg))
-        st.cache_resource.clear(); st.cache_data.clear()
-        st.rerun()
+    st.markdown("---")
+    st.subheader("Files on disk (debug)")
+    rep = _path_exists_report()
+    st.code(json.dumps(rep, indent=2))
+
+    cols_dbg = st.columns(3)
+    with cols_dbg[0]:
+        if st.button("Rebuild precompute (admin)"):
+            with st.spinner("Building centroids and summaries…"):
+                msg=_run_precompute_inline()
+            st.success(str(msg))
+            st.cache_resource.clear(); st.cache_data.clear(); st.rerun()
+    with cols_dbg[1]:
+        if st.button("Repair centroids norms"):
+            with st.spinner("Renormalizing centroids…"):
+                msg=_repair_centroids_in_place()
+            st.success(msg)
+            st.cache_resource.clear(); st.cache_data.clear(); st.rerun()
+    with cols_dbg[2]:
+        st.caption(f"summaries path: {VID_SUM_JSON}")
+        if not VID_SUM_JSON.exists():
+            st.warning("Summaries missing. Rebuild precompute.")
 
     st.markdown("---")
     st.caption("Keyword coverage scan (verification only).")
@@ -749,7 +782,7 @@ vm = load_video_meta()
 C, vid_list = load_video_centroids()
 summaries = load_video_summaries()
 
-# Stage A: route to top 5 using bullets+centroid+recency
+# Stage A: route to top 5
 qv = embedder.encode([prompt], normalize_embeddings=True).astype("float32")[0]
 def _creator_of_vid(vid:str)->str|None:
     raw = _raw_creator_of_vid(vid, vm)
