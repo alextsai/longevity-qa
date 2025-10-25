@@ -6,12 +6,13 @@ Longevity / Nutrition Q&A — Experts-first RAG with trusted web support
 Behavior:
 - Route → then scan: rank all videos via bullets+centroid+recency, pick top 5, then search chunks only in those.
 - Extractive bullets with timestamps; answers cite videos (Video k) and web (DOMAIN Wj).
-- Experts and trusted sites: vertical checklists, all selected by default; per-expert counts; synonyms incl. 'heathly'.
-- Admin diagnostics: precompute rebuild, norms/dim checks, mtimes, keyword scan; source JSON export.
+- Experts and trusted sites: vertical checklists, all selected by default; per-expert counts; creator-name normalization.
+- Admin diagnostics: precompute rebuild, norms/dim checks, mtimes, freshness check, keyword scan; source JSON export.
 """
 
 from __future__ import annotations
 
+# Quiet noisy libs
 import os
 os.environ.setdefault("TOKENIZERS_PARALLELISM","false")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY","1")
@@ -19,7 +20,7 @@ os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS","1")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES","")
 
 from pathlib import Path
-import sys, json, pickle, time, re, math
+import sys, json, pickle, time, re
 from typing import List, Dict, Any, Set, Tuple
 from datetime import datetime
 
@@ -29,7 +30,7 @@ import faiss
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
-# Optional web fetch
+# Optional web fetch deps (safe fail)
 try:
     import requests
     from bs4 import BeautifulSoup
@@ -76,20 +77,13 @@ EXCLUDED_CREATORS_EXACT = {
 }
 CREATOR_SYNONYMS = {
     "heathy immune doc": "Healthy Immune Doc",
-    "heathly immune doc": "Healthy Immune Doc",  # common typo
+    "heathly immune doc": "Healthy Immune Doc",
     "healthy immune doc": "Healthy Immune Doc",
+    "healthy  immune  doc": "Healthy Immune Doc",
+    "healthy immune doc youtube": "Healthy Immune Doc",
+    "healthy immune doc ": "Healthy Immune Doc",
     "the diary of a ceo": "The Diary of A CEO",
 }
-
-def canonicalize_creator(name: str) -> str | None:
-    n = (name or "").strip()
-    if not n: return None
-    low = n.lower()
-    if low in EXCLUDED_CREATORS_EXACT: return None
-    low = CREATOR_SYNONYMS.get(low, low)
-    for canon in ALLOWED_CREATORS:
-        if low == canon.lower(): return canon
-    return None
 
 # ------------ Utils ------------
 def _normalize_text(s:str)->str: return re.sub(r"\s+"," ",(s or "").strip())
@@ -119,6 +113,12 @@ def _file_mtime(p:Path)->float:
     try:return p.stat().st_mtime
     except:return 0.0
 
+def _iso(ts: float) -> str:
+    try:
+        return datetime.fromtimestamp(ts).isoformat()
+    except Exception:
+        return "n/a"
+
 def _clear_chat():
     st.session_state["messages"]=[]
     st.rerun()
@@ -133,6 +133,23 @@ def _is_admin()->bool:
     if expected is None: return True
     return qp.get("key","")==str(expected)
 
+# ------------ Creator normalization ------------
+def canonicalize_creator(name: str) -> str | None:
+    n = (name or "").strip()
+    if not n: return None
+    low = re.sub(r"\s+", " ", n.lower()).strip()
+    low = low.replace("™","").replace("®","").strip()
+    if low in EXCLUDED_CREATORS_EXACT: return None
+    low = CREATOR_SYNONYMS.get(low, low)
+    for canon in ALLOWED_CREATORS:
+        if low == canon.lower(): return canon
+    # punct/space tolerant fallback
+    strip_punct = re.sub(r"[^\w\s]", "", low)
+    for canon in ALLOWED_CREATORS:
+        if strip_punct == re.sub(r"[^\w\s]", "", canon.lower()):
+            return canon
+    return None
+
 # ------------ Loaders ------------
 @st.cache_data(show_spinner=False, hash_funcs={Path:_file_mtime})
 def load_video_meta()->Dict[str,Dict[str,Any]]:
@@ -140,6 +157,15 @@ def load_video_meta()->Dict[str,Dict[str,Any]]:
         try:return json.loads(VIDEO_META_JSON.read_text(encoding="utf-8"))
         except:return {}
     return {}
+
+def _raw_creator_of_vid(vid:str, vm:dict)->str:
+    info = vm.get(vid, {}) or {}
+    for k in ("podcaster","channel","author","uploader","owner","creator"):
+        if k in info and info[k]: return str(info[k])
+    for k,v in ((kk.lower(), vv) for kk,vv in info.items()):
+        if k in {"podcaster","channel","author","uploader","owner","creator"} and v:
+            return str(v)
+    return "Unknown"
 
 def _vid_epoch(vm:dict, vid:str)->float:
     info=(vm or {}).get(vid,{})
@@ -314,7 +340,7 @@ def route_videos_by_summary(
     scored.sort(key=lambda x:-x[1])
     return [v for v,_ in scored[:int(topK)]]
 
-# ------------ Stage B search (respects filtered candidate_vids) ------------
+# ------------ Stage B search ------------
 def stageB_search_chunks(query:str,
     index:faiss.Index, embedder:SentenceTransformer,
     candidate_vids:Set[str] | None,
@@ -341,7 +367,7 @@ def stageB_search_chunks(query:str,
         m["start"]=_parse_ts(m.get("start",0))
         if t:
             texts.append(t); metas.append(m)
-            keep.append((candidate_vids is None) or (vid in candidate_vids))  # empty set → False for all
+            keep.append((candidate_vids is None) or (vid in candidate_vids))  # empty set → keep False
 
     if any(keep):
         texts=[t for t,k in zip(texts,keep) if k]
@@ -391,7 +417,7 @@ def build_grouped_evidence_for_prompt(hits:List[Dict[str,Any]], vm:dict, summari
     for v_idx,(vid,items) in enumerate(ordered,1):
         info=vm.get(vid,{})
         title=info.get("title") or summaries.get(vid,{}).get("title") or vid
-        creator_raw=info.get("podcaster") or info.get("channel") or "Unknown"
+        creator_raw=_raw_creator_of_vid(vid, vm)
         creator=canonicalize_creator(creator_raw) or creator_raw
         date=info.get("published_at") or info.get("publishedAt") or info.get("date") or summaries.get(vid,{}).get("published_at") or ""
         lines.append(f"[Video {v_idx}] {title} — {creator}" + (f" — {date}" if date else ""))
@@ -508,7 +534,6 @@ def _run_precompute_inline()->str:
             return "ok: rebuilt via package import"
         except Exception:
             import importlib.util
-            from pathlib import Path
             p = Path(__file__).resolve().parents[1] / "scripts" / "precompute_video_summaries.py"
             spec = importlib.util.spec_from_file_location("pvs_fallback", str(p))
             if spec is None or spec.loader is None:
@@ -520,7 +545,7 @@ def _run_precompute_inline()->str:
     except Exception as e:
         return f"precompute error: {e}"
 
-# ------------ Verification helper (admin UI uses this) ------------
+# ------------ Verification helper (admin) ------------
 def scan_chunks_for_terms(terms:List[str], vm:Dict[str,Dict[str,Any]], limit_examples:int=200):
     if not CHUNKS_PATH.exists():
         return {"total_matches":0,"per_creator":{},"examples":[]}
@@ -536,7 +561,7 @@ def scan_chunks_for_terms(terms:List[str], vm:Dict[str,Dict[str,Any]], limit_exa
             vid=m.get("video_id") or m.get("vid") or m.get("ytid") or j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id") or "Unknown"
             st_sec=_parse_ts(m.get("start", m.get("start_sec",0)))
             info=vm.get(vid,{})
-            creator=info.get("podcaster") or info.get("channel") or "Unknown"
+            creator=_raw_creator_of_vid(vid, vm)
             canon = canonicalize_creator(creator)
             label = canon if canon else creator
             per_creator[label]=per_creator.get(label,0)+1
@@ -576,13 +601,9 @@ with st.sidebar:
 
     # Experts vertical list with counts
     vm = load_video_meta()
-    def _raw_creator_of(vid:str)->str:
-        info=vm.get(vid,{})
-        return info.get("podcaster") or info.get("channel") or "Unknown"
-
     counts={canon:0 for canon in ALLOWED_CREATORS}
     for vid in vm:
-        canon = canonicalize_creator(_raw_creator_of(vid))
+        canon = canonicalize_creator(_raw_creator_of_vid(vid, vm))
         if canon is None: continue
         counts[canon]=counts.get(canon,0)+1
 
@@ -630,8 +651,8 @@ with st.sidebar:
 if show_diag:
     colA,colB,colC = st.columns([2,3,3])
     with colA: st.caption(f"DATA_DIR = `{DATA_ROOT}`")
-    with colB: st.caption(f"chunks.jsonl mtime: {datetime.fromtimestamp(_file_mtime(CHUNKS_PATH)).isoformat() if CHUNKS_PATH.exists() else 'missing'}")
-    with colC: st.caption(f"index mtime: {datetime.fromtimestamp(_file_mtime(INDEX_PATH)).isoformat() if INDEX_PATH.exists() else 'missing'}")
+    with colB: st.caption(f"chunks mtime: {_iso(_file_mtime(CHUNKS_PATH)) if CHUNKS_PATH.exists() else 'missing'}")
+    with colC: st.caption(f"index mtime: {_iso(_file_mtime(INDEX_PATH)) if INDEX_PATH.exists() else 'missing'}")
 
 # Chat history
 if "messages" not in st.session_state: st.session_state.messages=[]
@@ -657,10 +678,27 @@ if _is_admin():
         st.metric("Norms ~1.0", "Yes" if status.get("ok_norms") else "No")
         st.metric("Dim matches encoder", "Yes" if status.get("ok_dim") else "No")
     with col3:
-        st.caption(f"chunks mtime: {datetime.fromtimestamp(status.get('chunks_mtime',0)).isoformat() if status.get('chunks_mtime') else 'n/a'}")
-        st.caption(f"centroids mtime: {datetime.fromtimestamp(status.get('cent_mtime',0)).isoformat() if status.get('cent_mtime') else 'n/a'}")
-        st.caption(f"ids mtime: {datetime.fromtimestamp(status.get('ids_mtime',0)).isoformat() if status.get('ids_mtime') else 'n/a'}")
-    for msg in status.get("msg",[]): st.warning(msg)
+        st.caption(f"chunks mtime: {_iso(status.get('chunks_mtime',0))}")
+        st.caption(f"centroids mtime: {_iso(status.get('cent_mtime',0))}")
+        st.caption(f"ids mtime: {_iso(status.get('ids_mtime',0))}")
+
+    # Freshness check
+    cent_m   = _file_mtime(VID_CENT_NPY)
+    ids_m    = _file_mtime(VID_IDS_TXT)
+    chunks_m = _file_mtime(CHUNKS_PATH)
+    ok_cent = bool(cent_m and chunks_m and cent_m > chunks_m)
+    ok_ids  = bool(ids_m  and chunks_m and ids_m  > chunks_m)
+
+    st.subheader("Precompute freshness check")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("centroids newer than chunks", "Yes" if ok_cent else "No")
+        st.caption(f"centroids: {_iso(cent_m)}  |  chunks: {_iso(chunks_m)}")
+    with c2:
+        st.metric("ids newer than chunks", "Yes" if ok_ids else "No")
+        st.caption(f"ids: {_iso(ids_m)}  |  chunks: {_iso(chunks_m)}")
+    if not (ok_cent and ok_ids):
+        st.warning("Centroids/IDs are older than chunks.jsonl. Click **Rebuild precompute (admin)**.")
 
     if st.button("Rebuild precompute (admin)"):
         with st.spinner("Building centroids and summaries…"):
@@ -713,9 +751,8 @@ summaries = load_video_summaries()
 
 # Stage A: route to top 5 using bullets+centroid+recency
 qv = embedder.encode([prompt], normalize_embeddings=True).astype("float32")[0]
-
 def _creator_of_vid(vid:str)->str|None:
-    raw = vm.get(vid,{}).get("podcaster") or vm.get(vid,{}).get("channel") or "Unknown"
+    raw = _raw_creator_of_vid(vid, vm)
     return canonicalize_creator(raw)
 
 allowed_vids = {
@@ -743,7 +780,7 @@ with st.spinner("Scanning selected videos…"):
         with st.chat_message("assistant"):
             st.error("Search failed."); st.exception(e); st.stop()
 
-# Optional web
+# Optional web support
 web_snips=[]
 if allow_web and selected_domains and requests and BeautifulSoup and int(max_web)>0:
     with st.spinner("Fetching trusted websites…"):
@@ -769,7 +806,7 @@ with st.chat_message("assistant"):
     st.markdown(ans)
     st.session_state.messages.append({"role":"assistant","content":ans})
 
-    # Sources UI
+    # Sources UI + JSON export
     with st.expander("Sources & timestamps", expanded=False):
         groups = group_hits_by_video(hits)
         ordered = sorted(groups.items(), key=lambda kv: max(x["score"] for x in kv[1]), reverse=True)
@@ -779,7 +816,7 @@ with st.chat_message("assistant"):
         for vid, items in ordered:
             info = vm.get(vid, {})
             title = info.get("title") or summaries.get(vid, {}).get("title") or vid
-            creator_raw = info.get("podcaster") or info.get("channel") or ""
+            creator_raw = _raw_creator_of_vid(vid, vm)
             creator = canonicalize_creator(creator_raw) or creator_raw
             url = info.get("url") or ""
             header = f"**{title}**" + (f" — _{creator}_" if creator else "")
