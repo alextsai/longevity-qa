@@ -502,9 +502,21 @@ def openai_answer(model_name:str, question:str, history:List[Dict[str,str]], gro
 # ------------ Inline precompute (admin) ------------
 def _run_precompute_inline()->str:
     try:
-        from scripts import precompute_video_summaries as pvs  # type: ignore
-        pvs.main()
-        return "ok: rebuilt"
+        try:
+            from scripts import precompute_video_summaries as pvs  # type: ignore
+            pvs.main()
+            return "ok: rebuilt via package import"
+        except Exception:
+            import importlib.util
+            from pathlib import Path
+            p = Path(__file__).resolve().parents[1] / "scripts" / "precompute_video_summaries.py"
+            spec = importlib.util.spec_from_file_location("pvs_fallback", str(p))
+            if spec is None or spec.loader is None:
+                return f"precompute error: cannot load {p}"
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+            mod.main()
+            return "ok: rebuilt via file loader"
     except Exception as e:
         return f"precompute error: {e}"
 
