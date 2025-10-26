@@ -3,11 +3,14 @@
 """
 Longevity / Nutrition Q&A — experts-first RAG with trusted web support.
 
-Highlights
-- Route then scan: rank videos by bullets + centroid + recency, pick top 5, then search only those videos.
-- Experts and trusted sites are vertical checklists. All selected by default. Per-expert video counts shown.
+Key design
+- Route then scan: rank videos by per-video bullets + centroid + recency, pick top 5, then search only those videos.
+- Experts and trusted sites are vertical checklists. All selected by default. Per-expert video counts come from chunks.jsonl
+  (falls back to video_meta.json) so mislabeled metadata does not hide videos.
 - Admin panel: rebuild precompute, repair centroid norms, build summaries fallback, freshness checks, keyword scan.
 - Sources export as JSON from the expander.
+
+This file is self-contained and safe to drop in.
 """
 
 from __future__ import annotations
@@ -494,14 +497,14 @@ def openai_answer(model_name:str, question:str, history:List[Dict[str,str]], gro
         "Rules:\n"
         "• Cite every claim/step: (Video k) for videos, (DOMAIN Wj) for web.\n"
         "• Prefer human clinical data; label animal/in-vitro/mechanistic explicitly.\n"
-        "• Normalize units and report numeric effect sizes when sources provide them (%, mg/dL, mmol/L, ApoB). "
-        "If ranges disagree, state both and indicate higher-quality evidence.\n"
+        "• Normalize units and report numeric effect sizes when provided (%, mg/dL, mmol/L, ApoB). "
+        "If ranges disagree, state both and note higher-quality evidence.\n"
         "• List therapeutic OPTIONS by class and drug names from videos/web; include mechanism and typical magnitude; "
         "if dose missing, write 'dose not specified'. No diagnosis.\n"
         "Structure:\n"
         "• Key summary — specific, detailed, source-grounded, with numbers when available\n"
         "• Practical protocol — numbered, stepwise, actionable\n"
-        "• Safety notes — contraindications, interactions, and when to consult a clinician\n"
+        "• Safety notes — contraindications, interactions, when to consult a clinician\n"
         "Output must be concise, uncertainty labeled, and free of speculation.\n"
         "Use only quoted bullets and chunk quotes; do not invent claims."
     )
@@ -623,6 +626,36 @@ def _path_exists_report()->Dict[str, Any]:
         "summaries": str(VID_SUM_JSON), "summaries_exists": VID_SUM_JSON.exists(),
     }
 
+# ---------------- Chunks-derived creator index ----------------
+def build_creator_indexes_from_chunks(vm: dict) -> tuple[dict, dict]:
+    """Return (vid_to_creator, creator_to_vids) using chunks.jsonl first, else vm."""
+    vid_to_creator: Dict[str,str] = {}
+    creator_to_vids: Dict[str,set] = {}
+    if CHUNKS_PATH.exists():
+        with CHUNKS_PATH.open(encoding="utf-8") as f:
+            for ln in f:
+                try: j=json.loads(ln)
+                except: continue
+                m = (j.get("meta") or {})
+                vid = (m.get("video_id") or m.get("vid") or m.get("ytid") or
+                       j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id"))
+                if not vid: continue
+                raw = (m.get("channel") or m.get("author") or m.get("uploader") or
+                       _raw_creator_of_vid(vid, vm))
+                canon = canonicalize_creator(raw)
+                if canon is None: continue
+                if vid not in vid_to_creator:
+                    vid_to_creator[vid] = canon
+                    creator_to_vids.setdefault(canon, set()).add(vid)
+    # fill any missing from vm
+    for vid in vm.keys():
+        if vid in vid_to_creator: continue
+        canon = canonicalize_creator(_raw_creator_of_vid(vid, vm))
+        if canon is None: continue
+        vid_to_creator[vid]=canon
+        creator_to_vids.setdefault(canon,set()).add(vid)
+    return vid_to_creator, creator_to_vids
+
 # ---------------- Verification helper (admin) ----------------
 def scan_chunks_for_terms(terms:List[str], vm:Dict[str,Dict[str,Any]], limit_examples:int=200):
     if not CHUNKS_PATH.exists():
@@ -655,37 +688,50 @@ st.title("Longevity / Nutrition Q&A")
 
 with st.sidebar:
     st.header("Answer settings")
-    initial_k = st.number_input("How many passages to scan first", 32, 5000, 768, 32,
-        help="Passages to score before final selection. After routing we scan inside 5 videos.")
-    final_k = st.number_input("How many passages to use", 8, 80, 36, 2,
-        help="How many top passages inform the answer.")
-    max_videos = st.number_input("Maximum videos to use", 1, 12, 5, 1,
-        help="Breadth without rambling.")
-    per_video_cap = st.number_input("Passages per video", 1, 10, 4, 1,
-        help="Prevents one video from dominating.")
+    initial_k = st.number_input(
+        "How many passages to scan first", 32, 5000, 768, 32,
+        help="First-pass recall. The app embeds your question, pulls this many candidate passages from ALL indexed chunks inside the routed videos, then refines. Higher = better coverage but slower."
+    )
+    final_k = st.number_input(
+        "How many passages to use", 8, 80, 36, 2,
+        help="Second-pass selection. The top K passages after diversification are fed to the writer. Higher = more evidence but risk of rambling."
+    )
+    max_videos = st.number_input(
+        "Maximum videos to use", 1, 12, 5, 1,
+        help="Upper bound on distinct videos that can contribute evidence. Keeps answers focused and readable."
+    )
+    per_video_cap = st.number_input(
+        "Passages per video", 1, 10, 4, 1,
+        help="Limit per source so one video cannot dominate the answer. Typical sweet spot: 3–4."
+    )
 
     st.subheader("Balance variety and accuracy")
-    use_mmr = st.checkbox("Encourage variety (recommended)", value=True,
-        help="Reduces near-duplicate quotes for broader coverage.")
-    mmr_lambda = st.slider("Balance: accuracy vs variety", 0.1, 0.9, 0.45, 0.05,
-        help="Right = closer match. Left = more diverse.")
+    use_mmr = st.checkbox(
+        "Encourage variety (recommended)", value=True,
+        help="Applies Maximal Marginal Relevance. Removes near-duplicate quotes so different angles are covered."
+    )
+    mmr_lambda = st.slider(
+        "Balance: accuracy vs variety", 0.1, 0.9, 0.45, 0.05,
+        help="0.1 = more diverse but looser matches. 0.9 = very tight matches but less breadth. 0.4–0.5 works well."
+    )
 
     st.subheader("Prefer newer videos")
-    recency_weight = st.slider("Recency influence", 0.0, 1.0, 0.20, 0.05,
-        help="Small preference for newer material.")
-    half_life = st.slider("Recency half-life (days)", 7, 720, 270, 7,
-        help="After this many days, recency value halves.")
+    recency_weight = st.slider(
+        "Recency influence", 0.0, 1.0, 0.20, 0.05,
+        help="How much newer videos are favored when ranking sources. 0 = ignore publish date. 1 = strongly prefer recent."
+    )
+    half_life = st.slider(
+        "Recency half-life (days)", 7, 720, 270, 7,
+        help="Time-decay for recency. Each half-life reduces recency weight by 50%. Smaller = prefer very recent uploads."
+    )
 
-    # Experts with counts
+    # Experts with counts derived from chunks + vm
     vm = load_video_meta()
-    counts={canon:0 for canon in ALLOWED_CREATORS}
-    for vid in vm:
-        canon = canonicalize_creator(_raw_creator_of_vid(vid, vm))
-        if canon is None: continue
-        counts[canon]=counts.get(canon,0)+1
+    vid_to_creator, creator_to_vids = build_creator_indexes_from_chunks(vm)
+    counts={canon: len(creator_to_vids.get(canon,set())) for canon in ALLOWED_CREATORS}
 
     st.subheader("Experts")
-    st.caption("All selected by default. Uncheck to exclude.")
+    st.caption("All selected by default. Uncheck to exclude. Counts show how many videos per expert are in your index.")
     selected_creators_list=[]
     for i, canon in enumerate(ALLOWED_CREATORS):
         label=f"{canon} ({counts.get(canon,0)})"
@@ -695,27 +741,32 @@ with st.sidebar:
 
     # Trusted sites
     st.subheader("Trusted sites")
-    st.caption("Short, reliable excerpts that support expert videos.")
+    st.caption("Short, vetted excerpts to support claims from expert videos. They act as secondary evidence, not the primary source.")
     allow_web = st.checkbox(
         "Add supporting excerpts from trusted sites",
         value=True,
-        help=("Turns on short quotes from trusted sites."
-              if (requests and BeautifulSoup) else
-              "Install 'requests' and 'beautifulsoup4' to enable."),
+        help=("When enabled, the app fetches a few short paragraphs from the checked medical sites and blends them with the video evidence. If no relevant pages are found, the answer still works using videos alone."),
         disabled=(requests is None or BeautifulSoup is None)
     )
     selected_domains=[]
     for i,dom in enumerate(TRUSTED_DOMAINS):
         if st.checkbox(dom, value=True, key=f"site_{i}"):
             selected_domains.append(dom)
-    max_web = st.slider("Max supporting excerpts", 0, 8, 3, 1,
-        help="Upper limit on short quotes pulled from trusted sites.")
+    max_web = st.slider(
+        "Max supporting excerpts", 0, 8, 3, 1,
+        help="Ceiling for how many website snippets may be included. 2–3 keeps answers tight while adding references."
+    )
 
-    model_choice = st.selectbox("OpenAI model", ["gpt-4o-mini","gpt-4o","gpt-4.1-mini"], index=0,
-        help="Model used to compose the final answer.")
+    model_choice = st.selectbox(
+        "OpenAI model", ["gpt-4o-mini","gpt-4o","gpt-4.1-mini"], index=0,
+        help="Model used to write the final answer from the selected evidence. Mini = cheaper/faster; 4o/4.1-mini = stronger reasoning."
+    )
 
     st.divider()
-    show_diag = st.toggle("Show data diagnostics", value=False, help="Show file locations and last updated times.")
+    show_diag = st.toggle(
+        "Show data diagnostics", value=False,
+        help="Reveal file locations, modification times, and index health so you can verify precompute freshness without a shell."
+    )
     st.subheader("Library status")
     st.checkbox("chunks.jsonl present", value=CHUNKS_PATH.exists(), disabled=True)
     st.checkbox("offsets built", value=OFFSETS_NPY.exists(), disabled=True)
@@ -779,6 +830,7 @@ if _is_admin():
 
     st.markdown("---")
     st.subheader("Files on disk (debug)")
+    st.caption("Use these actions if freshness checks fail or summaries are missing.")
     rep = _path_exists_report()
     st.code(json.dumps(rep, indent=2))
 
@@ -803,7 +855,7 @@ if _is_admin():
             st.warning("Summaries missing. Use rebuild or fallback.")
 
     st.markdown("---")
-    st.caption("Keyword coverage scan (verification only).")
+    st.caption("Keyword coverage scan (verification only). Checks whether specific terms appear in your transcripts and which experts mention them. Does not affect answers.")
     default_terms = "apob, apo-b, ldl, statin, ezetimibe, pcsk9, bempedoic, inclisiran, niacin"
     term_input = st.text_input("Terms (comma-separated)", default_terms)
     if st.button("Run scan"):
@@ -846,17 +898,14 @@ summaries = load_video_summaries()
 
 # Stage A: route to top 5
 qv = embedder.encode([prompt], normalize_embeddings=True).astype("float32")[0]
-def _creator_of_vid(vid:str)->str|None:
-    raw = _raw_creator_of_vid(vid, vm)
-    return canonicalize_creator(raw)
 
-allowed_vids = {
-    vid for vid in (vid_list or list(vm.keys()))
-    if (_creator_of_vid(vid) in selected_creators)
-}
+# Use chunk-derived mapping for allow-list
+universe = set(vid_list or list(vm.keys()))
+allowed_vids = {vid for vid in universe if vid_to_creator.get(vid) in selected_creators}
+
 topK = 5
 routed_vids = route_videos_by_summary(
-    prompt, qv, summaries, vm, C, vid_list, allowed_vids,
+    prompt, qv, summaries, vm, C, list(universe), allowed_vids,
     topK=topK, recency_weight=float(recency_weight), half_life_days=float(half_life)
 )
 candidate_vids = set(routed_vids) if routed_vids else allowed_vids
@@ -903,6 +952,7 @@ with st.chat_message("assistant"):
 
     # Sources UI + JSON export
     with st.expander("Sources & timestamps", expanded=False):
+        st.caption("Each bullet shows the timestamped quote pulled from a video. Web items are listed separately as supporting references.")
         groups = group_hits_by_video(hits)
         ordered = sorted(groups.items(), key=lambda kv: max(x["score"] for x in kv[1]), reverse=True)
 
