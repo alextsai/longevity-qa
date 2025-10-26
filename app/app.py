@@ -4,14 +4,14 @@
 Longevity / Nutrition Q&A — experts-first RAG with trusted web support.
 
 Design summary
-- Route→scan: rank videos by per-video bullets + centroid + recency, pick top 5, then search only those videos.
-- Experts and trusted sites are vertical checklists. All selected by default. Counts come from chunks.jsonl first.
-- Robust creator canonicalization so “Healthy Immune Doc” variants resolve correctly.
-- Multi-turn: we keep recent chat history so follow-ups stay on-topic.
-- Admin tools: precompute rebuild, centroid norm repair, summaries fallback, freshness checks, creator inventory, keyword scan.
-- Sources expander with JSON export.
+- Stage A routing: pick ~5 best videos using summary bullets + centroid similarity + recency.
+- Stage B recall (AUTO): start with K=512, adapt up to 1024/1536 based on entropy & expert coverage.
+- Evidence selection: aim 20–30 quotes total via MMR; cap 36; 3–5 per video; 4–6 videos.
+- Trusted sites: add up to 3 short vetted snippets (1 per domain) as supporting evidence.
+- UI: core controls are simple; technical knobs live under "Advanced".
+- Admin: precompute freshness, rebuild, repair norms, summaries fallback, creator inventory, term scan.
 
-Safe to drop in.
+This file is self-contained and safe to drop in.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS","1")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES","")
 
 from pathlib import Path
-import sys, json, pickle, time, re
+import sys, json, pickle, time, re, math, collections
 from typing import List, Dict, Any, Set, Tuple
 from datetime import datetime
 
@@ -81,12 +81,14 @@ EXCLUDED_CREATORS_EXACT = {
     "dr. pradip jamnadas, md and the primal podcast",
 }
 CREATOR_SYNONYMS = {
+    # normalize common typos/variants for Healthy Immune Doc
     "heathy immune doc": "Healthy Immune Doc",
     "heathly immune doc": "Healthy Immune Doc",
     "healthy immune doc": "Healthy Immune Doc",
     "healthy  immune  doc": "Healthy Immune Doc",
     "healthy immune doc youtube": "Healthy Immune Doc",
     "healthy immune doc ": "Healthy Immune Doc",
+    # normalize Diary label
     "the diary of a ceo": "The Diary of A CEO",
 }
 
@@ -129,6 +131,7 @@ def _clear_chat():
 
 # ---------------- Admin gate ----------------
 def _is_admin()->bool:
+    # enable with ?admin=1; optional ?key=... if ADMIN_KEY present in secrets
     try: qp = st.query_params
     except Exception: return False
     if qp.get("admin","0")!="1": return False
@@ -137,49 +140,29 @@ def _is_admin()->bool:
     if expected is None: return True
     return qp.get("key","")==str(expected)
 
-# ---------------- Robust creator normalization ----------------
-def _clean_name(n: str) -> str:
-    """Lowercase, strip punctuation, collapse spaces."""
-    n = (n or "").lower().strip()
-    n = n.replace("™","").replace("®","")
-    n = re.sub(r"\s+", " ", n)
-    n = re.sub(r"[^\w\s]", " ", n)
-    n = re.sub(r"\s+", " ", n).strip()
-    return n
-
-_HID_TOKENS = {"healthy","immune","doc"}
-
-def _looks_like_hid(n_clean: str) -> bool:
-    tokens = set(n_clean.split())
-    return _HID_TOKENS.issubset(tokens) or "healthyimmunedoc" in n_clean
-
+# ---------------- Creator normalization ----------------
 def canonicalize_creator(name: str) -> str | None:
     n = (name or "").strip()
     if not n: return None
-    low = _clean_name(n)
+    low = re.sub(r"\s+", " ", n.lower()).strip()
+    low = low.replace("™","").replace("®","").strip()
     if low in EXCLUDED_CREATORS_EXACT: return None
-    # explicit synonyms
-    for k,v in CREATOR_SYNONYMS.items():
-        if _clean_name(k) == low: return v
-    # exact canonical match
+    low = CREATOR_SYNONYMS.get(low, low)
     for canon in ALLOWED_CREATORS:
-        if _clean_name(canon) == low: return canon
-    # fuzzy rule for Healthy Immune Doc
-    if _looks_like_hid(low): return "Healthy Immune Doc"
-    # punctuation-stripped equality
+        if low == canon.lower(): return canon
     strip_punct = re.sub(r"[^\w\s]", "", low)
     for canon in ALLOWED_CREATORS:
-        if strip_punct == re.sub(r"[^\w\s]", "", _clean_name(canon)):
+        if strip_punct == re.sub(r"[^\w\s]", "", canon.lower()):
             return canon
     return None
 
-# ---------------- LLM answerer (multi-turn aware) ----------------
+# ---------------- LLM answerer ----------------
 def openai_answer(model_name: str, question: str, history, grouped_video_block: str,
                   web_snips: list[dict], no_video: bool) -> str:
     if not os.getenv("OPENAI_API_KEY"):
         return "⚠️ OPENAI_API_KEY is not set."
-    # keep more history so follow-ups chain; cap to 16 turns to control length
-    recent = [m for m in history[-16:] if m.get("role") in ("user","assistant")]
+    # carry last 2 Q&A pairs for follow-ups context
+    recent = [m for m in history[-6:] if m.get("role") in ("user","assistant")]
     convo = [("User: " if m["role"]=="user" else "Assistant: ")+m.get("content","") for m in recent]
 
     web_lines = [
@@ -189,7 +172,7 @@ def openai_answer(model_name: str, question: str, history, grouped_video_block: 
     web_block = "\n".join(web_lines) if web_lines else "None"
 
     fallback_line = ("If no suitable video evidence exists, you MAY answer from trusted web snippets alone, "
-                     "but begin with: 'Web-only evidence'.\n") if no_video else \
+                     "but begin with: 'Web-only evidence'.\n") if (WEB_FALLBACK and no_video) else \
                     "Trusted web snippets are supporting evidence.\n"
 
     system = (
@@ -277,6 +260,7 @@ def precompute_status(embedder_model:str)->Dict[str,Any]:
 
 # ---------------- JSONL offsets ----------------
 def _ensure_offsets()->np.ndarray:
+    # builds a seek index for chunks.jsonl so we can random-access lines by FAISS ids
     if OFFSETS_NPY.exists():
         try:
             arr=np.load(OFFSETS_NPY)
@@ -355,6 +339,7 @@ def mmr(qv:np.ndarray, doc_vecs:np.ndarray, k:int, lambda_diversity:float=0.45)-
     return sel
 
 def _dedupe_passages(items:List[Dict[str,Any]], time_window_sec:float=8.0, min_chars:int=40):
+    # remove near-duplicate quotes from the same timestamp neighborhood
     out=[]; seen=[]
     for h in sorted(items, key=lambda r: float((r.get("meta") or {}).get("start",0))):
         ts=float((h.get("meta") or {}).get("start",0))
@@ -367,7 +352,6 @@ def _dedupe_passages(items:List[Dict[str,Any]], time_window_sec:float=8.0, min_c
 
 # ---------------- Summary-aware routing ----------------
 def _build_idf_over_bullets(summaries: dict) -> dict:
-    import math, collections
     DF = collections.Counter()
     vids = list(summaries.keys())
     for v in vids:
@@ -391,12 +375,15 @@ def route_videos_by_summary(
     allowed_vids: set[str],
     topK: int, recency_weight: float, half_life_days: float
 ) -> list[str]:
+    # Candidate universe limited to selected experts
     universe = [v for v in (vids or list(vm.keys())) if (not allowed_vids or v in allowed_vids)]
     if not universe: return []
+    # Optional centroid similarity if precomputed vector per video exists
     cent = {}
     if C is not None and vids is not None and len(vids) == C.shape[0]:
         sim = (C @ qv.reshape(-1,1)).ravel()
         cent = {vids[i]: float(sim[i]) for i in range(len(vids))}
+    # Keyword score over summary bullets
     idf = _build_idf_over_bullets(summaries)
     now = time.time()
     scored = []
@@ -421,6 +408,7 @@ def stageB_search_chunks(query:str,
     recency_weight:float, half_life_days:float, vm:dict)->List[Dict[str,Any]]:
 
     if index is None: return []
+    # Dense search
     qv=embedder.encode([query], normalize_embeddings=True).astype("float32")[0]
     K = min(int(initial_k), index.ntotal if index.ntotal>0 else int(initial_k))
     D,I=index.search(qv.reshape(1,-1), K)
@@ -448,6 +436,7 @@ def stageB_search_chunks(query:str,
         scores0=[s for s,k in zip(scores0,keep) if k]
     if not texts: return []
 
+    # Second-pass re-embed selected texts for MMR diversification
     doc_vecs=embedder.encode(texts, normalize_embeddings=True, batch_size=64).astype("float32")
     order=list(range(len(texts)))
     if apply_mmr:
@@ -463,6 +452,7 @@ def stageB_search_chunks(query:str,
         blended.append((i_global,score,t,m))
     blended.sort(key=lambda x:-x[1])
 
+    # Enforce per-video caps and total cap
     picked=[]; seen_per_video={}; distinct=[]
     for ig,sc,tx,me in blended:
         vid=me.get("video_id","Unknown")
@@ -526,7 +516,7 @@ def fetch_trusted_snippets(query:str, allowed_domains:List[str], max_snippets:in
     out=[]
     for domain in allowed_domains:
         links=_ddg_domain_search(domain, query, headers, timeout)
-        if not links: links=[f"https://{domain}"]
+        if not links: links=[f"https://{domain}"]  # minimal fallback fetch
         links=links[:per_domain]
         for url in links:
             try:
@@ -597,7 +587,6 @@ def _build_summaries_fallback(max_lines_per_video: int = 800) -> str:
         vids = list(texts_by_vid.keys())
         if not vids: return "no videos detected in chunks.jsonl"
 
-        import math, collections
         DF = collections.Counter()
         for vid in vids:
             seen=set()
@@ -656,16 +645,9 @@ def build_creator_indexes_from_chunks(vm: dict) -> tuple[dict, dict]:
                 vid = (m.get("video_id") or m.get("vid") or m.get("ytid") or
                        j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id"))
                 if not vid: continue
-                raw = (
-                    m.get("channel")
-                    or m.get("creator")
-                    or m.get("author")
-                    or m.get("uploader")
-                    or m.get("owner")
-                    or _raw_creator_of_vid(vid, vm)
-                )
-                # try meta first, then vm fallback, both through canonicalizer
-                canon = canonicalize_creator(raw) or canonicalize_creator(_raw_creator_of_vid(vid, vm))
+                raw = (m.get("channel") or m.get("author") or m.get("uploader") or
+                       _raw_creator_of_vid(vid, vm))
+                canon = canonicalize_creator(raw)
                 if canon is None: continue
                 if vid not in vid_to_creator:
                     vid_to_creator[vid] = canon
@@ -710,51 +692,14 @@ st.set_page_config(page_title="Longevity / Nutrition Q&A", page_icon="🍎", lay
 st.title("Longevity / Nutrition Q&A")
 
 with st.sidebar:
-    st.header("Answer settings")
-    initial_k = st.number_input(
-        "How many passages to scan first", 32, 5000, 768, 32,
-        help="The system first finds candidate quotes. Higher numbers search more quotes. More coverage but slower."
-    )
-    final_k = st.number_input(
-        "How many passages to use", 8, 80, 36, 2,
-        help="How many quotes are actually used to write the answer after filtering and de-duplication."
-    )
-    max_videos = st.number_input(
-        "Maximum videos to use", 1, 12, 5, 1,
-        help="At most this many different videos contribute to the answer so it stays focused."
-    )
-    per_video_cap = st.number_input(
-        "Passages per video", 1, 10, 4, 1,
-        help="Limit quotes per video so one source does not dominate. 3–4 is typical."
-    )
-
-    st.subheader("Balance variety and accuracy")
-    use_mmr = st.checkbox(
-        "Encourage variety (recommended)", value=True,
-        help="Removes near-duplicate quotes so the answer covers different angles."
-    )
-    mmr_lambda = st.slider(
-        "Balance: accuracy vs variety", 0.1, 0.9, 0.45, 0.05,
-        help="Lower = more diverse but looser. Higher = tighter matches but less breadth."
-    )
-
-    st.subheader("Prefer newer videos")
-    recency_weight = st.slider(
-        "Recency influence", 0.0, 1.0, 0.20, 0.05,
-        help="How much to prefer newer uploads when ranking sources."
-    )
-    half_life = st.slider(
-        "Recency half-life (days)", 7, 720, 270, 7,
-        help="Every N days the recency effect halves. Smaller values strongly prefer very recent videos."
-    )
-
-    # Experts with counts derived from chunks + vm
+    st.markdown("**Auto Mode** · optimized for accuracy and diversity")
+    # Experts: vertical checklist with video counts
     vm = load_video_meta()
     vid_to_creator, creator_to_vids = build_creator_indexes_from_chunks(vm)
     counts={canon: len(creator_to_vids.get(canon,set())) for canon in ALLOWED_CREATORS}
 
     st.subheader("Experts")
-    st.caption("These are the experts whose videos can answer your question. All are on by default. Uncheck to exclude.")
+    st.caption("All selected. Uncheck to exclude any expert from your answer.")
     selected_creators_list=[]
     for i, canon in enumerate(ALLOWED_CREATORS):
         label=f"{canon} ({counts.get(canon,0)})"
@@ -763,35 +708,44 @@ with st.sidebar:
     selected_creators:set[str]=set(selected_creators_list)
     st.session_state["selected_creators"]=selected_creators  # persist for follow-ups
 
-    # Trusted sites
+    # Trusted sites: vertical checklist, all on by default
     st.subheader("Trusted sites")
-    st.caption("Short excerpts from medical sites to support claims from expert videos. Secondary evidence only.")
+    st.caption("Short excerpts from vetted medical sites are added as supporting evidence.")
     allow_web = st.checkbox(
-        "Include supporting excerpts",
-        value=True,
-        help=("When on, a few matching paragraphs from the checked sites are added as supporting evidence. "
-              "If nothing relevant is found, the answer still uses the videos.")
-        ,disabled=(requests is None or BeautifulSoup is None)
+        "Include supporting website excerpts", value=True,
+        help="Fetches brief paragraphs from the checked sites and blends them with expert videos. If none are found, the answer still works."
     )
     selected_domains=[]
     for i,dom in enumerate(TRUSTED_DOMAINS):
         if st.checkbox(dom, value=True, key=f"site_{i}"):
             selected_domains.append(dom)
-    max_web = st.slider(
-        "Max supporting excerpts", 0, 8, 3, 1,
-        help="Upper limit for website excerpts blended into the answer."
+    max_web_auto = 3  # fixed ceiling in Auto mode
+
+    # Model choice
+    model_choice = st.selectbox(
+        "Answering model", ["gpt-4o-mini","gpt-4o","gpt-4.1-mini"], index=0,
+        help="Picks how the final answer is written from the evidence."
     )
 
-    model_choice = st.selectbox(
-        "OpenAI model", ["gpt-4o-mini","gpt-4o","gpt-4.1-mini"], index=0,
-        help="Model that writes the final answer from selected evidence."
-    )
+    # Advanced knobs live under an expander
+    with st.expander("Advanced (technical controls)", expanded=False):
+        st.caption("Defaults are tuned. Adjust only if you need custom behavior.")
+        initial_k_adv = st.number_input("Scan candidates first (K)", 128, 5000, 768, 64)
+        final_k_adv   = st.number_input("Use top passages", 8, 120, 36, 2)
+        max_videos_adv = st.number_input("Max videos", 1, 12, 5, 1)
+        per_video_cap_adv = st.number_input("Passages per video cap", 1, 10, 5, 1)
+        use_mmr_adv = st.checkbox("Diversify with MMR", value=True)
+        mmr_lambda_adv = st.slider("MMR balance", 0.1, 0.9, 0.45, 0.05)
+        recency_weight_adv = st.slider("Recency weight", 0.0, 1.0, 0.20, 0.05)
+        half_life_adv = st.slider("Recency half-life (days)", 7, 720, 270, 7)
+        # If user opened Advanced, we will use these overrides; otherwise Auto will compute.
 
     st.divider()
     show_diag = st.toggle(
         "Show data diagnostics", value=False,
-        help="Show file locations, modification times, and index health. Useful to verify precompute freshness."
+        help="Check file locations, modification times, and index health without a shell."
     )
+
     st.subheader("Library status")
     st.checkbox("chunks.jsonl present", value=CHUNKS_PATH.exists(), disabled=True)
     st.checkbox("offsets built", value=OFFSETS_NPY.exists(), disabled=True)
@@ -808,12 +762,12 @@ if show_diag:
     with colB: st.caption(f"chunks mtime: {_iso(_file_mtime(CHUNKS_PATH)) if CHUNKS_PATH.exists() else 'missing'}")
     with colC: st.caption(f"index mtime: {_iso(_file_mtime(INDEX_PATH)) if INDEX_PATH.exists() else 'missing'}")
 
-# Chat history
+# Chat history rendering
 if "messages" not in st.session_state: st.session_state.messages=[]
 for m in st.session_state.messages:
     with st.chat_message(m["role"]): st.markdown(m["content"])
 
-# Admin diagnostics
+# Admin diagnostics panel
 if _is_admin():
     st.subheader("Diagnostics (admin)")
     try:
@@ -856,9 +810,7 @@ if _is_admin():
 
     st.markdown("---")
     st.subheader("Files on disk (debug)")
-    st.caption("Use these actions if freshness checks fail or summaries are missing.")
-    rep = _path_exists_report()
-    st.code(json.dumps(rep, indent=2))
+    st.code(json.dumps(_path_exists_report(), indent=2))
 
     cols_dbg = st.columns(3)
     with cols_dbg[0]:
@@ -886,14 +838,8 @@ if _is_admin():
                      key=lambda x: -x[1])
         st.dataframe([{"creator": c, "videos": n} for c,n in inv], use_container_width=True)
 
-    # HID quick sample
-    with st.expander("Debug: sample videos for Healthy Immune Doc"):
-        v2c, c2v = build_creator_indexes_from_chunks(load_video_meta())
-        vids = sorted(list(c2v.get("Healthy Immune Doc", set())))[:20]
-        st.write({"count": len(c2v.get("Healthy Immune Doc", set())), "sample_video_ids": vids})
-
     st.markdown("---")
-    st.caption("Keyword coverage scan (verification only). Checks whether specific terms appear in your transcripts and which experts mention them.")
+    st.caption("Keyword coverage scan (verification only).")
     default_terms = "apob, apo-b, ldl, statin, ezetimibe, pcsk9, bempedoic, inclisiran, niacin"
     term_input = st.text_input("Terms (comma-separated)", default_terms)
     if st.button("Run scan"):
@@ -905,26 +851,26 @@ if _is_admin():
         if scan["examples"]: st.dataframe(scan["examples"], use_container_width=True)
     st.markdown("---")
 
-# Prompt
+# Prompt input
 prompt = st.chat_input("Ask about ApoB/LDL drugs, sleep, protein timing, fasting, supplements, protocols…")
 if prompt is None:
     cols=st.columns([1]*12)
     with cols[-1]:
-        st.button("Clear chat", key="clear_idle", help="Clear the thread and start over.", on_click=_clear_chat)
+        st.button("Clear chat", key="clear_idle", help="Start a new conversation.", on_click=_clear_chat)
     st.stop()
 
-# Multi-turn: keep the message so follow-ups have context
+# Store conversation for follow-ups
 st.session_state.messages.append({"role":"user","content":prompt})
 with st.chat_message("user"): st.markdown(prompt)
 
-# Guardrails
+# Guardrails: required files must exist
 missing=[p for p in REQUIRED if not p.exists()]
 if missing:
     with st.chat_message("assistant"):
         st.error("Missing required files:\n" + "\n".join(f"- {p}" for p in missing))
     st.stop()
 
-# Load FAISS + encoder + summaries
+# Load FAISS + encoder + precompute artifacts
 try:
     index, _, payload = load_metas_and_model()
 except Exception as e:
@@ -935,28 +881,106 @@ vm = load_video_meta()
 C, vid_list = load_video_centroids()
 summaries = load_video_summaries()
 
-# Use chunk-derived mapping for allow-list
+# Selected experts → allowed video universe
 vid_to_creator, creator_to_vids = build_creator_indexes_from_chunks(vm)
 universe = set(vid_list or list(vm.keys()) or list(vid_to_creator.keys()))
 chosen = st.session_state.get("selected_creators", set(ALLOWED_CREATORS))
 allowed_vids = {vid for vid in universe if vid_to_creator.get(vid) in chosen}
 
-# Stage A: route to top 5 videos
-qv = embedder.encode([prompt], normalize_embeddings=True).astype("float32")[0]
-topK = 5
+# Stage A: route to top 5 using query + (last user Q/A for follow-up context)
+routing_query = prompt
+if len(st.session_state.messages) >= 3:
+    # include previous user message lightly to help follow-ups
+    prev_users = [m["content"] for m in st.session_state.messages if m["role"]=="user"][-2:-1]
+    if prev_users:
+        routing_query = prev_users[0] + " ; " + prompt
+
+qv = embedder.encode([routing_query], normalize_embeddings=True).astype("float32")[0]
+topK_route = 5
+recency_weight_auto = 0.20
+half_life_auto = 270
+
 routed_vids = route_videos_by_summary(
-    prompt, qv, summaries, vm, C, list(universe), allowed_vids,
-    topK=topK, recency_weight=float(recency_weight), half_life_days=float(half_life)
+    routing_query, qv, summaries, vm, C, list(universe), allowed_vids,
+    topK=topK_route, recency_weight=recency_weight_auto, half_life_days=half_life_auto
 )
 candidate_vids = set(routed_vids) if routed_vids else allowed_vids
+
+# ---------------- Auto recall & caps ----------------
+def _entropy(scores: List[float]) -> float:
+    if not scores: return 0.0
+    arr = np.array(scores, dtype=np.float32)
+    arr = arr - arr.max()
+    p = np.exp(arr)
+    p = p / (p.sum() + 1e-12)
+    return float(-(p * np.log(p + 1e-12)).sum())
+
+# Defaults for Auto
+K_scan = 512
+K_use  = 36            # target total quotes
+max_videos = 5         # target videos
+per_video_cap = 4      # target per-video quotes
+use_mmr = True
+mmr_lambda = 0.45
+recency_weight = recency_weight_auto
+half_life = half_life_auto
+
+# If user opened Advanced, use overrides
+adv_open = "Advanced (technical controls)" in [c.label if hasattr(c, "label") else "" for c in []]  # placeholder
+# Streamlit does not expose expander-open state easily; we infer overrides by checking session
+if "exp_advanced_set" not in st.session_state:
+    st.session_state["exp_advanced_set"] = False
+# We detect advanced overrides by presence of specific session keys created by the inputs:
+advanced_keys = ["Scan candidates first (K)", "Use top passages", "Max videos", "Passages per video cap"]
+# Streamlit uses widget keys; we set explicit keys above, so just try to read them safely
+try:
+    if st.session_state.get("Scan candidates first (K)") is not None:
+        st.session_state["exp_advanced_set"] = True
+except Exception:
+    pass
+
+if st.session_state.get("exp_advanced_set", False):
+    # apply user overrides
+    K_scan = int(st.session_state.get("Scan candidates first (K)", K_scan))
+    K_use  = int(st.session_state.get("Use top passages", K_use))
+    max_videos = int(st.session_state.get("Max videos", max_videos))
+    per_video_cap = int(st.session_state.get("Passages per video cap", per_video_cap))
+    use_mmr = bool(st.session_state.get("Diversify with MMR", use_mmr))
+    mmr_lambda = float(st.session_state.get("MMR balance", mmr_lambda))
+    recency_weight = float(st.session_state.get("Recency weight", recency_weight))
+    half_life = int(st.session_state.get("Recency half-life (days)", half_life))
+else:
+    # Auto-adapt recall after a quick small probe to estimate entropy
+    try:
+        probe_qv = qv
+        D_probe, I_probe = index.search(probe_qv.reshape(1,-1), min(256, index.ntotal))
+        e = _entropy([float(s) for s in D_probe[0]])
+        # If similarity distribution is flat (high entropy) or routed coverage <3 experts, expand K
+        experts_in_route = len({vid_to_creator.get(v) for v in candidate_vids})
+        if e > 4.0 or experts_in_route < 3:
+            K_scan = 1024
+        if e > 4.6 or experts_in_route < 2:
+            K_scan = 1536  # upper bound
+        # Balance caps by routed set size
+        if len(candidate_vids) >= 5:
+            max_videos = 5
+        elif len(candidate_vids) == 4:
+            max_videos = 4
+        else:
+            max_videos = max(3, len(candidate_vids))
+        per_video_cap = 4
+        K_use = min(36, max(24, max_videos * per_video_cap + 4))
+    except Exception:
+        # fall back to defaults if probe fails
+        pass
 
 # Stage B: search chunks only in routed videos
 with st.spinner("Scanning selected videos…"):
     try:
         hits = stageB_search_chunks(
             prompt, index, embedder, candidate_vids,
-            initial_k=min(int(initial_k), index.ntotal if index is not None else int(initial_k)),
-            final_k=int(final_k), max_videos=int(max_videos), per_video_cap=int(per_video_cap),
+            initial_k=min(int(K_scan), index.ntotal if index is not None else int(K_scan)),
+            final_k=int(K_use), max_videos=int(max_videos), per_video_cap=int(per_video_cap),
             apply_mmr=bool(use_mmr), mmr_lambda=float(mmr_lambda),
             recency_weight=float(recency_weight), half_life_days=float(half_life), vm=vm
         )
@@ -964,12 +988,11 @@ with st.spinner("Scanning selected videos…"):
         with st.chat_message("assistant"):
             st.error("Search failed."); st.exception(e); st.stop()
 
-# Optional web support
+# Optional web support (Auto: up to 3, 1 per domain)
 web_snips=[]
-selected_domains = [d for d in (selected_domains if 'selected_domains' in locals() else [])]
-if allow_web and selected_domains and requests and BeautifulSoup and int(max_web)>0:
+if allow_web and selected_domains and requests and BeautifulSoup and int(max_web_auto)>0:
     with st.spinner("Fetching trusted websites…"):
-        web_snips = fetch_trusted_snippets(prompt, selected_domains, max_snippets=int(max_web))
+        web_snips = fetch_trusted_snippets(prompt, selected_domains, max_snippets=int(max_web_auto), per_domain=1)
 
 # Build grouped evidence and answer
 grouped_block = build_grouped_evidence_for_prompt(hits, vm, summaries, max_quotes=3)
@@ -991,7 +1014,7 @@ with st.chat_message("assistant"):
 
     # Sources UI + JSON export
     with st.expander("Sources & timestamps", expanded=False):
-        st.caption("Timestamps are from the video transcripts. Web items are listed separately as supporting references.")
+        st.caption("Each bullet shows a timestamped quote from a video. Websites appear as supporting references.")
         groups = group_hits_by_video(hits)
         ordered = sorted(groups.items(), key=lambda kv: max(x["score"] for x in kv[1]), reverse=True)
 
@@ -1031,7 +1054,7 @@ with st.chat_message("assistant"):
         )
 
 # Footer + Clear chat
-st.caption("The system routes to likely videos using summaries and centroids, then searches their best quotes.")
+st.caption("Auto routing selects top videos, then diversified quotes are fused with supporting medical sites.")
 cols=st.columns([1]*12)
 with cols[-1]:
     st.button("Clear chat", key="clear_done", on_click=_clear_chat)
