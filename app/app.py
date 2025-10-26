@@ -3,14 +3,15 @@
 """
 Longevity / Nutrition Q&A — experts-first RAG with trusted web support.
 
-Key design
-- Route then scan: rank videos by per-video bullets + centroid + recency, pick top 5, then search only those videos.
-- Experts and trusted sites are vertical checklists. All selected by default. Per-expert video counts come from chunks.jsonl
-  (falls back to video_meta.json) so mislabeled metadata does not hide videos.
-- Admin panel: rebuild precompute, repair centroid norms, build summaries fallback, freshness checks, keyword scan.
-- Sources export as JSON from the expander.
+Design summary
+- Route→scan: rank videos by per-video bullets + centroid + recency, pick top 5, then search only those videos.
+- Experts and trusted sites are vertical checklists. All selected by default. Counts come from chunks.jsonl first.
+- Robust creator canonicalization so “Healthy Immune Doc” variants resolve correctly.
+- Multi-turn: we keep recent chat history so follow-ups stay on-topic.
+- Admin tools: precompute rebuild, centroid norm repair, summaries fallback, freshness checks, creator inventory, keyword scan.
+- Sources expander with JSON export.
 
-This file is self-contained and safe to drop in.
+Safe to drop in.
 """
 
 from __future__ import annotations
@@ -136,28 +137,49 @@ def _is_admin()->bool:
     if expected is None: return True
     return qp.get("key","")==str(expected)
 
-# ---------------- Creator normalization ----------------
+# ---------------- Robust creator normalization ----------------
+def _clean_name(n: str) -> str:
+    """Lowercase, strip punctuation, collapse spaces."""
+    n = (n or "").lower().strip()
+    n = n.replace("™","").replace("®","")
+    n = re.sub(r"\s+", " ", n)
+    n = re.sub(r"[^\w\s]", " ", n)
+    n = re.sub(r"\s+", " ", n).strip()
+    return n
+
+_HID_TOKENS = {"healthy","immune","doc"}
+
+def _looks_like_hid(n_clean: str) -> bool:
+    tokens = set(n_clean.split())
+    return _HID_TOKENS.issubset(tokens) or "healthyimmunedoc" in n_clean
+
 def canonicalize_creator(name: str) -> str | None:
     n = (name or "").strip()
     if not n: return None
-    low = re.sub(r"\s+", " ", n.lower()).strip()
-    low = low.replace("™","").replace("®","").strip()
+    low = _clean_name(n)
     if low in EXCLUDED_CREATORS_EXACT: return None
-    low = CREATOR_SYNONYMS.get(low, low)
+    # explicit synonyms
+    for k,v in CREATOR_SYNONYMS.items():
+        if _clean_name(k) == low: return v
+    # exact canonical match
     for canon in ALLOWED_CREATORS:
-        if low == canon.lower(): return canon
+        if _clean_name(canon) == low: return canon
+    # fuzzy rule for Healthy Immune Doc
+    if _looks_like_hid(low): return "Healthy Immune Doc"
+    # punctuation-stripped equality
     strip_punct = re.sub(r"[^\w\s]", "", low)
     for canon in ALLOWED_CREATORS:
-        if strip_punct == re.sub(r"[^\w\s]", "", canon.lower()):
+        if strip_punct == re.sub(r"[^\w\s]", "", _clean_name(canon)):
             return canon
     return None
 
-# ---------------- LLM answerer ----------------
+# ---------------- LLM answerer (multi-turn aware) ----------------
 def openai_answer(model_name: str, question: str, history, grouped_video_block: str,
                   web_snips: list[dict], no_video: bool) -> str:
     if not os.getenv("OPENAI_API_KEY"):
         return "⚠️ OPENAI_API_KEY is not set."
-    recent = [m for m in history[-6:] if m.get("role") in ("user","assistant")]
+    # keep more history so follow-ups chain; cap to 16 turns to control length
+    recent = [m for m in history[-16:] if m.get("role") in ("user","assistant")]
     convo = [("User: " if m["role"]=="user" else "Assistant: ")+m.get("content","") for m in recent]
 
     web_lines = [
@@ -634,9 +656,16 @@ def build_creator_indexes_from_chunks(vm: dict) -> tuple[dict, dict]:
                 vid = (m.get("video_id") or m.get("vid") or m.get("ytid") or
                        j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id"))
                 if not vid: continue
-                raw = (m.get("channel") or m.get("author") or m.get("uploader") or
-                       _raw_creator_of_vid(vid, vm))
-                canon = canonicalize_creator(raw)
+                raw = (
+                    m.get("channel")
+                    or m.get("creator")
+                    or m.get("author")
+                    or m.get("uploader")
+                    or m.get("owner")
+                    or _raw_creator_of_vid(vid, vm)
+                )
+                # try meta first, then vm fallback, both through canonicalizer
+                canon = canonicalize_creator(raw) or canonicalize_creator(_raw_creator_of_vid(vid, vm))
                 if canon is None: continue
                 if vid not in vid_to_creator:
                     vid_to_creator[vid] = canon
@@ -684,39 +713,39 @@ with st.sidebar:
     st.header("Answer settings")
     initial_k = st.number_input(
         "How many passages to scan first", 32, 5000, 768, 32,
-        help="First-pass recall. The app embeds your question, pulls this many candidate passages from ALL indexed chunks inside the routed videos, then refines. Higher = better coverage but slower."
+        help="The system first finds candidate quotes. Higher numbers search more quotes. More coverage but slower."
     )
     final_k = st.number_input(
         "How many passages to use", 8, 80, 36, 2,
-        help="Second-pass selection. The top K passages after diversification are fed to the writer. Higher = more evidence but risk of rambling."
+        help="How many quotes are actually used to write the answer after filtering and de-duplication."
     )
     max_videos = st.number_input(
         "Maximum videos to use", 1, 12, 5, 1,
-        help="Upper bound on distinct videos that can contribute evidence. Keeps answers focused and readable."
+        help="At most this many different videos contribute to the answer so it stays focused."
     )
     per_video_cap = st.number_input(
         "Passages per video", 1, 10, 4, 1,
-        help="Limit per source so one video cannot dominate the answer. Typical sweet spot: 3–4."
+        help="Limit quotes per video so one source does not dominate. 3–4 is typical."
     )
 
     st.subheader("Balance variety and accuracy")
     use_mmr = st.checkbox(
         "Encourage variety (recommended)", value=True,
-        help="Applies Maximal Marginal Relevance. Removes near-duplicate quotes so different angles are covered."
+        help="Removes near-duplicate quotes so the answer covers different angles."
     )
     mmr_lambda = st.slider(
         "Balance: accuracy vs variety", 0.1, 0.9, 0.45, 0.05,
-        help="0.1 = more diverse but looser matches. 0.9 = very tight matches but less breadth. 0.4–0.5 works well."
+        help="Lower = more diverse but looser. Higher = tighter matches but less breadth."
     )
 
     st.subheader("Prefer newer videos")
     recency_weight = st.slider(
         "Recency influence", 0.0, 1.0, 0.20, 0.05,
-        help="How much newer videos are favored when ranking sources. 0 = ignore publish date. 1 = strongly prefer recent."
+        help="How much to prefer newer uploads when ranking sources."
     )
     half_life = st.slider(
         "Recency half-life (days)", 7, 720, 270, 7,
-        help="Time-decay for recency. Each half-life reduces recency weight by 50%. Smaller = prefer very recent uploads."
+        help="Every N days the recency effect halves. Smaller values strongly prefer very recent videos."
     )
 
     # Experts with counts derived from chunks + vm
@@ -725,25 +754,24 @@ with st.sidebar:
     counts={canon: len(creator_to_vids.get(canon,set())) for canon in ALLOWED_CREATORS}
 
     st.subheader("Experts")
-    st.caption("All selected by default. Uncheck to exclude. Counts show how many videos per expert are in your index.")
+    st.caption("These are the experts whose videos can answer your question. All are on by default. Uncheck to exclude.")
     selected_creators_list=[]
     for i, canon in enumerate(ALLOWED_CREATORS):
         label=f"{canon} ({counts.get(canon,0)})"
         if st.checkbox(label, value=True, key=f"exp_{i}"):
             selected_creators_list.append(canon)
     selected_creators:set[str]=set(selected_creators_list)
-    # persist selection for follow-ups
-    st.session_state["selected_creators"]=selected_creators
+    st.session_state["selected_creators"]=selected_creators  # persist for follow-ups
 
     # Trusted sites
     st.subheader("Trusted sites")
-    st.caption("Short, vetted excerpts to support claims from expert videos. They act as secondary evidence, not the primary source.")
+    st.caption("Short excerpts from medical sites to support claims from expert videos. Secondary evidence only.")
     allow_web = st.checkbox(
-        "Add supporting excerpts from trusted sites",
+        "Include supporting excerpts",
         value=True,
-        help=("When enabled, the app fetches a few short paragraphs from the checked medical sites and blends them with the video evidence. "
-              "If no relevant pages are found, the answer still works using videos alone."),
-        disabled=(requests is None or BeautifulSoup is None)
+        help=("When on, a few matching paragraphs from the checked sites are added as supporting evidence. "
+              "If nothing relevant is found, the answer still uses the videos.")
+        ,disabled=(requests is None or BeautifulSoup is None)
     )
     selected_domains=[]
     for i,dom in enumerate(TRUSTED_DOMAINS):
@@ -751,18 +779,18 @@ with st.sidebar:
             selected_domains.append(dom)
     max_web = st.slider(
         "Max supporting excerpts", 0, 8, 3, 1,
-        help="Ceiling for how many website snippets may be included. 2–3 keeps answers tight while adding references."
+        help="Upper limit for website excerpts blended into the answer."
     )
 
     model_choice = st.selectbox(
         "OpenAI model", ["gpt-4o-mini","gpt-4o","gpt-4.1-mini"], index=0,
-        help="Model used to write the final answer from the selected evidence. Mini = cheaper/faster; 4o/4.1-mini = stronger reasoning."
+        help="Model that writes the final answer from selected evidence."
     )
 
     st.divider()
     show_diag = st.toggle(
         "Show data diagnostics", value=False,
-        help="Reveal file locations, modification times, and index health so you can verify precompute freshness without a shell."
+        help="Show file locations, modification times, and index health. Useful to verify precompute freshness."
     )
     st.subheader("Library status")
     st.checkbox("chunks.jsonl present", value=CHUNKS_PATH.exists(), disabled=True)
@@ -858,8 +886,14 @@ if _is_admin():
                      key=lambda x: -x[1])
         st.dataframe([{"creator": c, "videos": n} for c,n in inv], use_container_width=True)
 
+    # HID quick sample
+    with st.expander("Debug: sample videos for Healthy Immune Doc"):
+        v2c, c2v = build_creator_indexes_from_chunks(load_video_meta())
+        vids = sorted(list(c2v.get("Healthy Immune Doc", set())))[:20]
+        st.write({"count": len(c2v.get("Healthy Immune Doc", set())), "sample_video_ids": vids})
+
     st.markdown("---")
-    st.caption("Keyword coverage scan (verification only). Checks whether specific terms appear in your transcripts and which experts mention them. Does not affect answers.")
+    st.caption("Keyword coverage scan (verification only). Checks whether specific terms appear in your transcripts and which experts mention them.")
     default_terms = "apob, apo-b, ldl, statin, ezetimibe, pcsk9, bempedoic, inclisiran, niacin"
     term_input = st.text_input("Terms (comma-separated)", default_terms)
     if st.button("Run scan"):
@@ -876,9 +910,10 @@ prompt = st.chat_input("Ask about ApoB/LDL drugs, sleep, protein timing, fasting
 if prompt is None:
     cols=st.columns([1]*12)
     with cols[-1]:
-        st.button("Clear chat", key="clear_idle", help="Start a new conversation.", on_click=_clear_chat)
+        st.button("Clear chat", key="clear_idle", help="Clear the thread and start over.", on_click=_clear_chat)
     st.stop()
 
+# Multi-turn: keep the message so follow-ups have context
 st.session_state.messages.append({"role":"user","content":prompt})
 with st.chat_message("user"): st.markdown(prompt)
 
@@ -931,6 +966,7 @@ with st.spinner("Scanning selected videos…"):
 
 # Optional web support
 web_snips=[]
+selected_domains = [d for d in (selected_domains if 'selected_domains' in locals() else [])]
 if allow_web and selected_domains and requests and BeautifulSoup and int(max_web)>0:
     with st.spinner("Fetching trusted websites…"):
         web_snips = fetch_trusted_snippets(prompt, selected_domains, max_snippets=int(max_web))
@@ -955,7 +991,7 @@ with st.chat_message("assistant"):
 
     # Sources UI + JSON export
     with st.expander("Sources & timestamps", expanded=False):
-        st.caption("Each bullet shows the timestamped quote pulled from a video. Web items are listed separately as supporting references.")
+        st.caption("Timestamps are from the video transcripts. Web items are listed separately as supporting references.")
         groups = group_hits_by_video(hits)
         ordered = sorted(groups.items(), key=lambda kv: max(x["score"] for x in kv[1]), reverse=True)
 
@@ -995,7 +1031,7 @@ with st.chat_message("assistant"):
         )
 
 # Footer + Clear chat
-st.caption("Routing uses extractive bullets + centroids to pick the best videos, then searches their chunks.")
+st.caption("The system routes to likely videos using summaries and centroids, then searches their best quotes.")
 cols=st.columns([1]*12)
 with cols[-1]:
     st.button("Clear chat", key="clear_done", on_click=_clear_chat)
