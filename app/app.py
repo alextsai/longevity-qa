@@ -1,13 +1,12 @@
 # app/app.py
 # -*- coding: utf-8 -*-
 """
-Longevity / Nutrition Q&A — experts-first RAG with trusted web support + persistent follow-up context.
+Longevity / Nutrition Q&A — experts-first RAG with trusted web support.
 
 Key design
 - Route then scan: rank videos by per-video bullets + centroid + recency, pick top 5, then search only those videos.
 - Experts and trusted sites are vertical checklists. All selected by default. Per-expert video counts come from chunks.jsonl
   (falls back to video_meta.json) so mislabeled metadata does not hide videos.
-- Persistent follow-ups: conversation-level topic memory + rolling evidence memory across turns.
 - Admin panel: rebuild precompute, repair centroid norms, build summaries fallback, freshness checks, keyword scan.
 - Sources export as JSON from the expander.
 
@@ -75,6 +74,7 @@ ALLOWED_CREATORS = [
     "Peter Attia MD",
     "The Diary of A CEO",
 ]
+# remove these exact combined labels if they show up in metadata
 EXCLUDED_CREATORS_EXACT = {
     "they diary of a ceo and louse tomlinson",
     "dr. pradip jamnadas, md and the primal podcast",
@@ -124,13 +124,7 @@ def _iso(ts: float) -> str:
 
 def _clear_chat():
     st.session_state["messages"]=[]
-    # reset persistent context when clearing chat
-    for k in ("context_topic","context_topic_vec","context_hits","context_videos","context_web_snips","last_turn_ts"):
-        st.session_state.pop(k, None)
     st.rerun()
-
-def _now()->float:
-    return time.time()
 
 # ---------------- Admin gate ----------------
 def _is_admin()->bool:
@@ -158,8 +152,56 @@ def canonicalize_creator(name: str) -> str | None:
             return canon
     return None
 
+# ---------------- LLM answerer ----------------
+def openai_answer(model_name: str, question: str, history, grouped_video_block: str,
+                  web_snips: list[dict], no_video: bool) -> str:
+    if not os.getenv("OPENAI_API_KEY"):
+        return "⚠️ OPENAI_API_KEY is not set."
+    recent = [m for m in history[-6:] if m.get("role") in ("user","assistant")]
+    convo = [("User: " if m["role"]=="user" else "Assistant: ")+m.get("content","") for m in recent]
+
+    web_lines = [
+        f"(W{j}) {s.get('domain','web')} — {s.get('url','')}\n“{' '.join((s.get('text','')).split())[:300]}”"
+        for j,s in enumerate(web_snips,1)
+    ]
+    web_block = "\n".join(web_lines) if web_lines else "None"
+
+    fallback_line = ("If no suitable video evidence exists, you MAY answer from trusted web snippets alone, "
+                     "but begin with: 'Web-only evidence'.\n") if no_video else \
+                    "Trusted web snippets are supporting evidence.\n"
+
+    system = (
+        "Answer from the provided evidence plus trusted web sources. Priority: (1) grouped VIDEO evidence from selected experts, "
+        "(2) trusted WEB snippets.\n" + fallback_line +
+        "Rules:\n"
+        "• Cite every claim/step: (Video k) for videos, (DOMAIN Wj) for web.\n"
+        "• Prefer human clinical data; label animal/in-vitro/mechanistic explicitly.\n"
+        "• Normalize units and report numeric effect sizes when provided (%, mg/dL, mmol/L, ApoB).\n"
+        "• List therapeutic OPTIONS by class and drug names; include mechanism and typical magnitude; "
+        "if dose missing, write 'dose not specified'. No diagnosis.\n"
+        "Structure: Key summary • Practical protocol • Safety notes. Be concise and source-grounded.\n"
+        "Use only quoted bullets and chunk quotes; do not invent claims."
+    )
+
+    user_payload = (("Recent conversation:\n"+"\n".join(convo)+"\n\n") if convo else "") + \
+                   f"Question: {question}\n\n" + \
+                   "Grouped Video Evidence:\n" + (grouped_video_block or "None") + "\n\n" + \
+                   "Trusted Web Snippets:\n" + web_block + "\n\n" + \
+                   "Write a concise, well-grounded answer."
+
+    try:
+        client = OpenAI(timeout=60)
+        r = client.chat.completions.create(
+            model=model_name, temperature=0.2,
+            messages=[{"role":"system","content":system},
+                      {"role":"user","content":user_payload}]
+        )
+        return (r.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"⚠️ Generation error: {e}"
+
 # ---------------- Loaders ----------------
-@st.cache_data(show_spinner=False, hash_funcs={Path:_file_mtime})
+@st.cache_data(show_spinner=False)
 def load_video_meta()->Dict[str,Dict[str,Any]]:
     if VIDEO_META_JSON.exists():
         try:return json.loads(VIDEO_META_JSON.read_text(encoding="utf-8"))
@@ -477,103 +519,6 @@ def fetch_trusted_snippets(query:str, allowed_domains:List[str], max_snippets:in
         if len(out)>=max_snippets: break
     return out[:max_snippets]
 
-# ---------------- Conversation follow-up logic ----------------
-def _is_followup_text(prompt:str)->bool:
-    """Cheap linguistic signal for follow-ups."""
-    p = prompt.lower()
-    return any(x in p for x in [
-        "what about", "how about", "and ", "also ", "dose", "dosing", "side effect", "interact",
-        "combine", "with that", "stack", "more detail", "clarify", "expand", "next", "then",
-        "ok but", "instead", "compared to", "vs ", "versus"
-    ])
-
-def decide_followup_and_query(
-    prompt:str,
-    embedder:SentenceTransformer
-)->Tuple[bool, str, np.ndarray]:
-    """Decide if this turn is a follow-up. Return (is_followup, query_for_retrieval, qv)."""
-    qv = embedder.encode([prompt], normalize_embeddings=True).astype("float32")[0]
-    last_topic = st.session_state.get("context_topic")
-    last_vec   = st.session_state.get("context_topic_vec")
-    # No prior topic → not a follow-up
-    if not last_topic or last_vec is None:
-        return (False, prompt, qv)
-    # Cosine similarity with prior topic
-    try:
-        sim = float(np.dot(qv, last_vec))
-    except Exception:
-        sim = 0.0
-    # Heuristic: text signal OR semantic similarity
-    if _is_followup_text(prompt) or sim >= 0.45:
-        expanded = f"{last_topic}  {prompt}"
-        return (True, expanded, qv)
-    return (False, prompt, qv)
-
-def update_context_after_answer(
-    base_question:str,
-    qv:np.ndarray,
-    new_hits:List[Dict[str,Any]],
-    new_web_snips:List[Dict[str,str]],
-    max_context_hits:int=20
-):
-    """Persist topic + rolling evidence across turns."""
-    # If no topic yet, set it to the current base_question
-    if not st.session_state.get("context_topic"):
-        st.session_state["context_topic"] = base_question
-        st.session_state["context_topic_vec"] = qv
-    # Update hits memory with dedup and cap
-    prev = st.session_state.get("context_hits", [])
-    merged = prev + new_hits
-    # Dedup by (video_id, start, text)
-    seen=set(); deduped=[]
-    for h in merged:
-        m=h.get("meta") or {}
-        vid=m.get("video_id","")
-        ts=float(m.get("start",0.0))
-        key=(vid, round(ts,1), _normalize_text(h.get("text",""))[:120])
-        if key in seen: continue
-        seen.add(key); deduped.append(h)
-    st.session_state["context_hits"] = deduped[-max_context_hits:]
-    # Update context videos set
-    vids = st.session_state.get("context_videos", set())
-    for h in new_hits:
-        v=(h.get("meta") or {}).get("video_id")
-        if v: vids.add(v)
-    st.session_state["context_videos"] = vids
-    # Web snippets rolling memory (cap 6)
-    ws_prev = st.session_state.get("context_web_snips", [])
-    ws = (ws_prev + new_web_snips)[-6:]
-    st.session_state["context_web_snips"] = ws
-    # Timestamp
-    st.session_state["last_turn_ts"] = _now()
-
-def maybe_reset_context(prompt:str):
-    """Reset when user explicitly changes topic or session is stale."""
-    p = (prompt or "").lower()
-    if any(k in p for k in ["new topic", "different question", "switch topic", "reset", "clear context"]):
-        for k in ("context_topic","context_topic_vec","context_hits","context_videos","context_web_snips"):
-            st.session_state.pop(k, None)
-        return
-    # Time-based reset: 12h idle
-    last_ts = st.session_state.get("last_turn_ts")
-    if last_ts and (_now() - float(last_ts) > 12*3600):
-        for k in ("context_topic","context_topic_vec","context_hits","context_videos","context_web_snips"):
-            st.session_state.pop(k, None)
-        return
-
-def build_thread_summary(vm:dict, summaries:dict)->str:
-    """Compact description of conversation evidence so far."""
-    vids = list(st.session_state.get("context_videos", set()) or [])
-    if not vids: return ""
-    names=[]
-    for v in vids[:8]:
-        info=vm.get(v,{})
-        title=info.get("title") or summaries.get(v,{}).get("title") or v
-        creator=_raw_creator_of_vid(v, vm)
-        canon=canonicalize_creator(creator) or creator
-        names.append(f"{title} — {canon}")
-    return "Prior evidence already considered:\n" + "\n".join(f"• {n}" for n in names)
-
 # ---------------- Precompute runners + repairs ----------------
 def _run_precompute_inline()->str:
     try:
@@ -787,6 +732,8 @@ with st.sidebar:
         if st.checkbox(label, value=True, key=f"exp_{i}"):
             selected_creators_list.append(canon)
     selected_creators:set[str]=set(selected_creators_list)
+    # persist selection for follow-ups
+    st.session_state["selected_creators"]=selected_creators
 
     # Trusted sites
     st.subheader("Trusted sites")
@@ -794,7 +741,8 @@ with st.sidebar:
     allow_web = st.checkbox(
         "Add supporting excerpts from trusted sites",
         value=True,
-        help=("When enabled, the app fetches a few short paragraphs from the checked medical sites and blends them with the video evidence. If no relevant pages are found, the answer still works using videos alone."),
+        help=("When enabled, the app fetches a few short paragraphs from the checked medical sites and blends them with the video evidence. "
+              "If no relevant pages are found, the answer still works using videos alone."),
         disabled=(requests is None or BeautifulSoup is None)
     )
     selected_domains=[]
@@ -825,6 +773,7 @@ with st.sidebar:
     cent_ready = VID_CENT_NPY.exists() and VID_IDS_TXT.exists() and VID_SUM_JSON.exists()
     st.caption("Video centroids/summaries: ready" if cent_ready else "Precompute not found. Use admin tools.")
 
+# Diagnostics area
 if show_diag:
     colA,colB,colC = st.columns([2,3,3])
     with colA: st.caption(f"DATA_DIR = `{DATA_ROOT}`")
@@ -903,6 +852,12 @@ if _is_admin():
         if not VID_SUM_JSON.exists():
             st.warning("Summaries missing. Use rebuild or fallback.")
 
+    # Creator inventory from chunks.jsonl
+    with st.expander("Creator inventory (from chunks.jsonl)"):
+        inv = sorted(((c, len(vs)) for c,vs in build_creator_indexes_from_chunks(load_video_meta())[1].items()),
+                     key=lambda x: -x[1])
+        st.dataframe([{"creator": c, "videos": n} for c,n in inv], use_container_width=True)
+
     st.markdown("---")
     st.caption("Keyword coverage scan (verification only). Checks whether specific terms appear in your transcripts and which experts mention them. Does not affect answers.")
     default_terms = "apob, apo-b, ldl, statin, ezetimibe, pcsk9, bempedoic, inclisiran, niacin"
@@ -923,9 +878,6 @@ if prompt is None:
     with cols[-1]:
         st.button("Clear chat", key="clear_idle", help="Start a new conversation.", on_click=_clear_chat)
     st.stop()
-
-# Reset context if user indicates a new topic or stale session
-maybe_reset_context(prompt)
 
 st.session_state.messages.append({"role":"user","content":prompt})
 with st.chat_message("user"): st.markdown(prompt)
@@ -948,44 +900,26 @@ vm = load_video_meta()
 C, vid_list = load_video_centroids()
 summaries = load_video_summaries()
 
-# Determine follow-up and expanded query
-is_followup, query_for_retrieval, qv = decide_followup_and_query(prompt, embedder)
-
 # Use chunk-derived mapping for allow-list
-vid_to_creator, _creator_to_vids = build_creator_indexes_from_chunks(vm)
-universe = set(vid_list or list(vm.keys()) or list(vid_to_creator.keys()) )
-# Respect selected experts
-allowed_vids = {vid for vid in universe if vid_to_creator.get(vid) in st.session_state.get("selected_creators", set())} \
-               if "selected_creators" in st.session_state else {vid for vid in universe if vid_to_creator.get(vid) in set(ALLOWED_CREATORS)}
+vid_to_creator, creator_to_vids = build_creator_indexes_from_chunks(vm)
+universe = set(vid_list or list(vm.keys()) or list(vid_to_creator.keys()))
+chosen = st.session_state.get("selected_creators", set(ALLOWED_CREATORS))
+allowed_vids = {vid for vid in universe if vid_to_creator.get(vid) in chosen}
 
-# If follow-up, prefer previously used videos as a first-class candidate set
-prior_videos = st.session_state.get("context_videos", set()) if is_followup else set()
-
-# Stage A: route to top 5 (on expanded query if follow-up)
+# Stage A: route to top 5 videos
+qv = embedder.encode([prompt], normalize_embeddings=True).astype("float32")[0]
 topK = 5
 routed_vids = route_videos_by_summary(
-    query_for_retrieval, qv, summaries, vm, C, list(universe), allowed_vids,
-    topK=topK, recency_weight=float(st.session_state.get("recency_weight", 0.20) if 'recency_weight' in st.session_state else 0.20),
-    half_life_days=float(st.session_state.get("half_life", 270) if 'half_life' in st.session_state else 270)
+    prompt, qv, summaries, vm, C, list(universe), allowed_vids,
+    topK=topK, recency_weight=float(recency_weight), half_life_days=float(half_life)
 )
-# Merge with prior videos if follow-up
-candidate_vids = set(routed_vids) | (prior_videos & allowed_vids) if is_followup else set(routed_vids or allowed_vids)
+candidate_vids = set(routed_vids) if routed_vids else allowed_vids
 
-# Read sidebar values again inside body (Streamlit keeps them in session_state)
-initial_k = int(st.session_state.get("How many passages to scan first", 768)) if isinstance(st.session_state.get("How many passages to scan first"), int) else 768
-final_k = int(st.session_state.get("How many passages to use", 36)) if isinstance(st.session_state.get("How many passages to use"), int) else 36
-max_videos = int(st.session_state.get("Maximum videos to use", 5)) if isinstance(st.session_state.get("Maximum videos to use"), int) else 5
-per_video_cap = int(st.session_state.get("Passages per video", 4)) if isinstance(st.session_state.get("Passages per video"), int) else 4
-use_mmr = bool(st.session_state.get("Encourage variety (recommended)", True))
-mmr_lambda = float(st.session_state.get("Balance: accuracy vs variety", 0.45)) if isinstance(st.session_state.get("Balance: accuracy vs variety"), float) else 0.45
-recency_weight = float(st.session_state.get("Recency influence", 0.20))
-half_life = float(st.session_state.get("Recency half-life (days)", 270))
-
-# Stage B: search chunks
+# Stage B: search chunks only in routed videos
 with st.spinner("Scanning selected videos…"):
     try:
-        hits_now = stageB_search_chunks(
-            query_for_retrieval, index, embedder, candidate_vids,
+        hits = stageB_search_chunks(
+            prompt, index, embedder, candidate_vids,
             initial_k=min(int(initial_k), index.ntotal if index is not None else int(initial_k)),
             final_k=int(final_k), max_videos=int(max_videos), per_video_cap=int(per_video_cap),
             apply_mmr=bool(use_mmr), mmr_lambda=float(mmr_lambda),
@@ -995,38 +929,17 @@ with st.spinner("Scanning selected videos…"):
         with st.chat_message("assistant"):
             st.error("Search failed."); st.exception(e); st.stop()
 
-# Merge rolling evidence if follow-up
-prior_hits = st.session_state.get("context_hits", []) if is_followup else []
-# Keep union then re-dedupe by video/time/text and re-cap to final_k
-merged_hits = prior_hits + hits_now
-merged_hits = _dedupe_passages(merged_hits, time_window_sec=6.0, min_chars=40)
-if len(merged_hits) > final_k:
-    # keep higher-score ones by approximating with presence order: latest search results first
-    # move hits_now to front to prioritize the current question's evidence
-    merged_hits = _dedupe_passages(hits_now + prior_hits, time_window_sec=6.0, min_chars=40)[:final_k]
-
 # Optional web support
-allow_web = bool(st.session_state.get("Add supporting excerpts from trusted sites", True)) and (requests is not None and BeautifulSoup is not None)
-selected_domains = [d for k,d in st.session_state.items() if k.startswith("site_") and isinstance(d,bool) and d]  # not reliable; gather from TRUSTED_DOMAINS instead
-# Build selected domains from checkboxes
-sel_domains=[]
-for i,dom in enumerate(TRUSTED_DOMAINS):
-    if st.session_state.get(f"site_{i}", True): sel_domains.append(dom)
-
-web_snips_now=[]
-if allow_web and sel_domains and int(st.session_state.get("Max supporting excerpts", 3))!=0:
+web_snips=[]
+if allow_web and selected_domains and requests and BeautifulSoup and int(max_web)>0:
     with st.spinner("Fetching trusted websites…"):
-        web_snips_now = fetch_trusted_snippets(prompt, sel_domains, max_snippets=int(st.session_state.get("Max supporting excerpts", 3)))
-# Merge rolling web snips if follow-up (cap 6)
-prior_web = st.session_state.get("context_web_snips", []) if is_followup else []
-web_snips = (prior_web + web_snips_now)[-6:]
+        web_snips = fetch_trusted_snippets(prompt, selected_domains, max_snippets=int(max_web))
 
 # Build grouped evidence and answer
-grouped_block = build_grouped_evidence_for_prompt(merged_hits, vm, summaries, max_quotes=3)
-thread_summary = build_thread_summary(vm, summaries)
+grouped_block = build_grouped_evidence_for_prompt(hits, vm, summaries, max_quotes=3)
 
 with st.chat_message("assistant"):
-    if not merged_hits and not web_snips:
+    if not hits and not web_snips:
         st.warning("No relevant evidence found.")
         st.session_state.messages.append({"role":"assistant","content":"I couldn’t find enough evidence to answer that."})
         cols=st.columns([1]*12)
@@ -1034,28 +947,16 @@ with st.chat_message("assistant"):
             st.button("Clear chat", key="clear_nohits", on_click=_clear_chat)
         st.stop()
 
-    # Pass a short thread summary by prepending to grouped evidence
-    grouped_for_llm = (thread_summary + "\n\n" if thread_summary else "") + grouped_block
-
     with st.spinner("Writing your answer…"):
-        model_choice = st.session_state.get("OpenAI model", "gpt-4o-mini") if isinstance(st.session_state.get("OpenAI model"), str) else "gpt-4o-mini"
-        ans=openai_answer(model_choice, prompt, st.session_state.messages, grouped_for_llm, web_snips, no_video=(len(merged_hits)==0))
+        ans=openai_answer(model_choice, prompt, st.session_state.messages, grouped_block, web_snips, no_video=(len(hits)==0))
 
     st.markdown(ans)
     st.session_state.messages.append({"role":"assistant","content":ans})
 
-    # Update context AFTER writing
-    update_context_after_answer(
-        base_question=st.session_state.get("context_topic", prompt) if is_followup else prompt,
-        qv=qv,
-        new_hits=hits_now,            # only add new hits to favor fresh evidence; prior already stored
-        new_web_snips=web_snips_now
-    )
-
     # Sources UI + JSON export
     with st.expander("Sources & timestamps", expanded=False):
         st.caption("Each bullet shows the timestamped quote pulled from a video. Web items are listed separately as supporting references.")
-        groups = group_hits_by_video(merged_hits)
+        groups = group_hits_by_video(hits)
         ordered = sorted(groups.items(), key=lambda kv: max(x["score"] for x in kv[1]), reverse=True)
 
         export = {"videos": [], "web": []}
@@ -1094,7 +995,7 @@ with st.chat_message("assistant"):
         )
 
 # Footer + Clear chat
-st.caption("Routing uses extractive bullets + centroids to pick the best videos, then searches their chunks. Follow-ups reuse topic and evidence across turns.")
+st.caption("Routing uses extractive bullets + centroids to pick the best videos, then searches their chunks.")
 cols=st.columns([1]*12)
 with cols[-1]:
     st.button("Clear chat", key="clear_done", on_click=_clear_chat)
