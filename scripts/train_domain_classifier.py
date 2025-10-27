@@ -1,62 +1,82 @@
-import json, yaml, re, joblib, numpy as np
+# scripts/train_domain_classifier.py
+# Train a simple SVM domain classifier on question text; persists model + thresholds.
+
+import json, re, yaml, argparse
 from pathlib import Path
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.pipeline import FeatureUnion
-from sentence_transformers import SentenceTransformer
+import numpy as np
+from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+import joblib
+from sentence_transformers import SentenceTransformer
 
-DATA = Path(os.getenv("DATA_DIR","/var/data"))
-SUM = json.loads((DATA/"data/catalog/video_summaries.json").read_text())
-VM  = json.loads((DATA/"data/catalog/video_meta.json").read_text())
+DOMAINS = ["cardio","sleep","nutrition","immune"]
 
-# 1) build texts
-texts=[]; y=[]
-for vid, s in SUM.items():
-    txt = " ".join([
-        VM.get(vid,{}).get("title",""),
-        s.get("summary",""),
-        " ".join([b.get("text","") for b in s.get("bullets",[])]),
-    ])
-    label = s.get("domain")  # start with curated labels; hand-correct file
-    if not label: continue
-    texts.append(txt); y.append(label)
+def norm(s:str)->str:
+    return re.sub(r"\s+"," ", (s or "").strip().lower())
 
-# 2) features
-wvec = TfidfVectorizer(ngram_range=(1,3), min_df=3, max_df=0.9, sublinear_tf=True, analyzer="word")
-cvec = TfidfVectorizer(ngram_range=(3,5), min_df=3, analyzer="char_wb")
-Xw = wvec.fit_transform(texts); Xc = cvec.fit_transform(texts)
+def load_dataset(p:Path):
+    """
+    Expects JSONL with fields: {"text": "...", "label": "cardio|sleep|nutrition|immune"}
+    Minimal starter: you can bootstrap from your own Q history.
+    """
+    X,Y=[],[]
+    for ln in p.read_text(encoding="utf-8").splitlines():
+        if not ln.strip(): continue
+        j=json.loads(ln)
+        t=norm(j.get("text","")); y=norm(j.get("label",""))
+        if t and y in DOMAINS:
+            X.append(t); Y.append(y)
+    return X,Y
 
-emb = SentenceTransformer("intfloat/e5-large-v2")
-Z  = emb.encode([f"passage: {t}" for t in texts], normalize_embeddings=True)
-scl = StandardScaler(with_mean=False)
-Zs = scl.fit_transform(Z)
+def main(args):
+    data_p = Path(args.data)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-from scipy.sparse import hstack
-X = hstack([Xw, Xc, Zs])
+    Xtxt, Ylab = load_dataset(data_p)
+    if not Xtxt: raise SystemExit("no training data")
 
-clf = CalibratedClassifierCV(LogisticRegression(max_iter=2000, n_jobs=-1, class_weight="balanced"))
-clf.fit(X, y)
+    enc = SentenceTransformer("intfloat/e5-large-v2")
+    Xemb = enc.encode(Xtxt, normalize_embeddings=True, batch_size=64).astype("float32")
 
-# 3) save
-joblib.dump({"w":wvec,"c":cvec,"clf":clf}, DATA/"data/catalog/domain_model.joblib")
-joblib.dump(scl, DATA/"data/catalog/scaler.joblib")
+    y_map = {d:i for i,d in enumerate(DOMAINS)}
+    y = np.array([y_map[l] for l in Ylab], dtype=np.int64)
 
-# 4) export per-video probabilities
-probs={}
-for vid,s in SUM.items():
-    txt = " ".join([VM.get(vid,{}).get("title",""), s.get("summary",""),
-                    " ".join([b.get("text","") for b in s.get("bullets",[])])])
-    Xw=wvec.transform([txt]); Xc=cvec.transform([txt]); Zs=scl.transform(emb.encode([f"passage: {txt}"], normalize_embeddings=True))
-    Xi=hstack([Xw,Xc,Zs])
-    p = dict(zip(clf.classes_, clf.predict_proba(Xi)[0].tolist()))
-    probs[vid]={"probs":p}
-Path(DATA/"data/catalog").mkdir(parents=True, exist_ok=True)
-(DATA/"data/catalog/domain_probs.yaml").write_text(yaml.safe_dump(probs, sort_keys=False))
+    Xtr, Xte, ytr, yte = train_test_split(Xemb, y, test_size=0.2, random_state=42, stratify=y)
 
-# 5) embedding distribution for OOD
-Zall = emb.encode([f"passage: { ' '.join([VM.get(v,{}).get('title',''), SUM[v].get('summary','')]) }" for v in SUM.keys()], normalize_embeddings=True)
-cent = Zall.mean(0); cov = np.cov(Zall.T)
-np.save(DATA/"data/catalog/emb_centroids.npy", cent)
-np.save(DATA/"data/catalog/emb_cov.npy", cov)
+    scaler = StandardScaler(with_mean=True, with_std=True)
+    Xtr_s = scaler.fit_transform(Xtr); Xte_s = scaler.transform(Xte)
+
+    clf = SVC(C=4.0, kernel="rbf", probability=True, class_weight="balanced", random_state=42)
+    clf.fit(Xtr_s, ytr)
+
+    ypro = clf.predict_proba(Xte_s)
+    yhat = ypro.argmax(1)
+    rep = classification_report(yte, yhat, target_names=DOMAINS, digits=3)
+    print(rep)
+
+    # Per-class OOD threshold = 25th percentile of max-prob when predicted correctly
+    maxp = ypro.max(1)
+    correct = (yhat==yte)
+    thr = {}
+    for i,d in enumerate(DOMAINS):
+        vals = maxp[(yhat==i)&correct]
+        thr[d] = float(np.percentile(vals, 25)) if len(vals)>5 else 0.40
+
+    # Persist
+    joblib.dump(clf, out_dir/"domain_model.joblib")
+    joblib.dump(scaler, out_dir/"scaler.joblib")
+    (out_dir/"label_map.json").write_text(json.dumps({str(i):d for i,d in enumerate(DOMAINS)}, indent=2))
+    (out_dir/"ood_threshold.json").write_text(json.dumps(thr, indent=2))
+
+    # Domain priors for transparency
+    pri = {d: float((y==i).mean()) for i,d in enumerate(DOMAINS)}
+    (out_dir/"domain_probs.yaml").write_text(yaml.safe_dump({"priors":pri, "eval_report":rep}, sort_keys=False))
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", required=True, help="path to domain_labeled.jsonl")
+    ap.add_argument("--out",  required=True, help="output dir, e.g., /var/data/data/models/domain")
+    main(ap.parse_args())
