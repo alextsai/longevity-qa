@@ -3,17 +3,16 @@
 """
 Longevity / Nutrition Q&A — experts-first RAG + trusted web support.
 
-What changed (high level)
-- Robust creator mapping: heuristics map variants like "Healthy Immune Doc" and "Diary of a CEO".
-- Routing guardrails: hybrid score = centroid + summary-keywords; also require minimal keyword overlap.
-- Recall that actually yields quotes: softer quote filter + guaranteed ≥1 quote per routed video.
-- Per-turn sources: each assistant reply stores its OWN sources; earlier turn sources are kept.
-- Web snippets that actually show: dual DuckDuckGo modes + homepage fallback + explicit debug trace.
-- Follow-ups: last 2 Q/As kept for LLM context and routing keyword expansion.
-- Admin: inventory table, freshness checks, rebuild, renorm, summaries-fallback.
-- Comments: every critical function documents assumptions and failure modes.
-
-This file is self-contained and safe to drop in.
+Key fixes/enhancements
+- Robust creator mapping so "Healthy Immune Doc" and "Diary of a CEO" variants resolve.
+- Routing guardrails: centroid + summary-keywords + minimal keyword overlap; lowered gate.
+- Recall fallback: if routed videos yield 0 quotes, widen to all selected experts and search deeper.
+- Quote filter softened and guaranteed ≥1 quote per routed video via chunk fallback.
+- Per-turn sources: each reply stores its own sources; earlier turns remain visible.
+- Web snippets reliability: dual DuckDuckGo modes, homepage fallback, debug trace.
+- Follow-ups: last 2 Q/As kept for LLM context and routing query.
+- Admin: inventory, freshness checks, rebuild, renorm, summaries-fallback.
+- Comments throughout explaining assumptions and failure modes.
 """
 
 from __future__ import annotations
@@ -41,7 +40,6 @@ try:
     from bs4 import BeautifulSoup
 except Exception:
     requests=None; BeautifulSoup=None
-
 
 # ---------------- Paths ----------------
 ROOT = Path(__file__).resolve().parents[1]
@@ -121,7 +119,6 @@ def _iso(ts: float) -> str:
 def _clear_chat():
     st.session_state["messages"]=[]; st.session_state["turns"]=[]; st.rerun()
 
-
 # ---------------- Admin gate ----------------
 def _is_admin()->bool:
     """Enable admin with ?admin=1 and optional ?key=... if ADMIN_KEY set in secrets."""
@@ -132,7 +129,6 @@ def _is_admin()->bool:
     except Exception: expected = None
     if expected is None: return True
     return qp.get("key","")==str(expected)
-
 
 # ---------------- Creator mapping ----------------
 def _raw_creator_of_vid(vid:str, vm:dict)->str:
@@ -156,7 +152,6 @@ def _canonicalize_creator(name: str) -> str | None:
     if not n: return None
     if n in EXCLUDED_CREATORS_EXACT: return None
 
-    # Heuristic buckets by token presence
     tokens = set(re.findall(r"[a-z0-9]+", n))
 
     # Healthy Immune Doc
@@ -181,7 +176,6 @@ def _canonicalize_creator(name: str) -> str | None:
         if re.sub(r"[^\w\s]","",n) == re.sub(r"[^\w\s]","",canon.lower()):
             return canon
     return None
-
 
 # ---------------- LLM answerer ----------------
 def openai_answer(model_name: str, question: str, history, grouped_video_block: str,
@@ -234,7 +228,6 @@ def openai_answer(model_name: str, question: str, history, grouped_video_block: 
     except Exception as e:
         return f"⚠️ Generation error: {e}"
 
-
 # ---------------- Loaders ----------------
 @st.cache_data(show_spinner=False)
 def load_video_meta()->Dict[str,Dict[str,Any]]:
@@ -281,7 +274,6 @@ def precompute_status(embedder_model:str)->Dict[str,Any]:
         status["msg"].append(f"precompute check error: {e}")
     return status
 
-
 # ---------------- JSONL offsets for random access ----------------
 def _ensure_offsets()->np.ndarray:
     """Build a seek index for chunks.jsonl so we can random-access by FAISS ids."""
@@ -311,7 +303,6 @@ def iter_jsonl_rows(indices:List[int], limit:int|None=None):
             f.seek(int(offs[i])); raw=f.readline()
             try: yield i, json.loads(raw)
             except: continue
-
 
 # ---------------- Model + FAISS ----------------
 @st.cache_resource(show_spinner=False)
@@ -350,7 +341,6 @@ def load_video_summaries():
         try:return json.loads(VID_SUM_JSON.read_text(encoding="utf-8"))
         except:return {}
     return {}
-
 
 # ---------------- Diversity (MMR) ----------------
 def mmr(qv:np.ndarray, doc_vecs:np.ndarray, k:int, lambda_diversity:float=0.45)->List[int]:
@@ -391,7 +381,6 @@ def _dedupe_passages(items:List[Dict[str,Any]], time_window_sec:float=8.0, min_c
         seen.append(h); out.append(h)
     return out
 
-
 # ---------------- Summary-aware routing ----------------
 def _build_idf_over_bullets(summaries: dict) -> dict:
     """Global IDF over summary bullets supports keyword score."""
@@ -399,7 +388,7 @@ def _build_idf_over_bullets(summaries: dict) -> dict:
     vids = list(summaries.keys())
     for v in vids:
         for b in summaries.get(v, {}).get("bullets", []):
-            toks = set((b.get("text","") or "").lower().split())
+            toks = set(re.findall(r"[a-z0-9]+", (b.get("text","") or "").lower()))
             for w in toks: DF[w] += 1
     N = max(1, len(vids))
     return {w: math.log((N+1)/(df+0.5)) for w,df in DF.items()}
@@ -423,11 +412,11 @@ def route_videos_by_summary(
     C: np.ndarray | None, vids: list[str] | None,
     allowed_vids: set[str],
     topK: int, recency_weight: float, half_life_days: float,
-    min_kw_overlap:int=2
+    min_kw_overlap:int=1  # relaxed gate
 ) -> list[str]:
     """
     Score videos by centroid similarity + bullet-keyword score + recency.
-    **New guard**: require at least `min_kw_overlap` keyword overlaps to reduce spurious picks.
+    Guard: require at least `min_kw_overlap` overlaps to reduce spurious picks.
     """
     universe = [v for v in (vids or list(vm.keys())) if (not allowed_vids or v in allowed_vids)]
     if not universe: return []
@@ -443,7 +432,7 @@ def route_videos_by_summary(
         pseudo = " ".join(b.get("text","") for b in bullets)[:2000]
         kw, overlap = _kw_score(pseudo, query, idf)
         if overlap < min_kw_overlap and len(pseudo)>0:
-            continue  # skip videos with near-zero topical overlap
+            continue
         cs = cent.get(v, 0.0)
         rec = _recency_score(_vid_epoch(vm, v), now, half_life_days)
         base = 0.6*cs + 0.3*kw
@@ -451,7 +440,6 @@ def route_videos_by_summary(
         scored.append((v, score))
     scored.sort(key=lambda x:-x[1])
     return [v for v,_ in scored[:int(topK)]]
-
 
 # ---------------- Stage B search ----------------
 def stageB_search_chunks(query:str,
@@ -517,7 +505,6 @@ def stageB_search_chunks(query:str,
         if len(picked)>=int(final_k): break
     return picked
 
-
 # ---------------- Grouped evidence ----------------
 def group_hits_by_video(hits:List[Dict[str,Any]])->Dict[str,List[Dict[str,Any]]]:
     g={}
@@ -528,7 +515,7 @@ def group_hits_by_video(hits:List[Dict[str,Any]])->Dict[str,List[Dict[str,Any]]]
 
 def build_grouped_evidence_for_prompt(hits:List[Dict[str,Any]], vm:dict, summaries:dict, max_quotes:int=3)->Tuple[str,Dict[str,Any]]:
     """
-    Build a human-readable block for the LLM **and** a structured export with per-quote timestamps.
+    Build human-readable block for LLM and structured export.
     Guarantees at least one quote per routed video by falling back to raw chunks if no bullets.
     """
     groups=group_hits_by_video(hits)
@@ -542,7 +529,6 @@ def build_grouped_evidence_for_prompt(hits:List[Dict[str,Any]], vm:dict, summari
         date=info.get("published_at") or info.get("publishedAt") or info.get("date") or summaries.get(vid,{}).get("published_at") or ""
         lines.append(f"[Video {v_idx}] {title} — {creator}" + (f" — {date}" if date else ""))
 
-        # 1) prefer summary bullets
         bullets = summaries.get(vid,{}).get("bullets", [])[:max_quotes]
         added=0
         for b in bullets:
@@ -553,7 +539,6 @@ def build_grouped_evidence_for_prompt(hits:List[Dict[str,Any]], vm:dict, summari
             export.append({"video_id":vid,"title":title,"creator":creator,"ts":ts,"text":q})
             added+=1
 
-        # 2) top raw chunks to ensure >=1 quote survives
         if added < max_quotes:
             clean=_dedupe_passages(items, time_window_sec=8.0, min_chars=40)
             for h in clean[:max(1, max_quotes - added)]:
@@ -563,7 +548,6 @@ def build_grouped_evidence_for_prompt(hits:List[Dict[str,Any]], vm:dict, summari
                 export.append({"video_id":vid,"title":title,"creator":creator,"ts":ts,"text":q})
         lines.append("")
     return "\n".join(lines).strip(), {"videos": export}
-
 
 # ---------------- Web fetch ----------------
 def _ddg_html(domain:str, query:str, headers:dict, timeout:float)->List[str]:
@@ -577,7 +561,7 @@ def _ddg_html(domain:str, query:str, headers:dict, timeout:float)->List[str]:
         return []
 
 def _ddg_lite(domain:str, query:str, headers:dict, timeout:float)->List[str]:
-    """Very simple lite endpoint that sometimes works when HTML throttles."""
+    """Lite endpoint that sometimes works when HTML throttles."""
     try:
         r=requests.get("https://duckduckgo.com/lite/", params={"q":f"site:{domain} {query}"}, headers=headers, timeout=timeout)
         if r.status_code!=200: return []
@@ -588,34 +572,29 @@ def _ddg_lite(domain:str, query:str, headers:dict, timeout:float)->List[str]:
 
 def fetch_trusted_snippets(query:str, allowed_domains:List[str], max_snippets:int=3, per_domain:int=1, timeout:float=6.0):
     """
-    Try HTML → Lite → homepage fallback. Returns list of {domain,url,text} and
-    writes a debug trace into st.session_state['web_trace'] for transparency.
+    Try HTML → Lite → homepage fallback. Returns list of {domain,url,text}
+    and writes a debug trace into st.session_state['web_trace'].
     """
-    trace=[]
-    out=[]
+    trace=[]; out=[]
     if not requests or not BeautifulSoup or max_snippets<=0:
         st.session_state["web_trace"] = "requests/bs4 missing or disabled."
         return []
-
     headers={"User-Agent":"Mozilla/5.0"}
     for domain in allowed_domains:
         links=_ddg_html(domain, query, headers, timeout)
         if not links:
             links=_ddg_lite(domain, query, headers, timeout)
-            trace.append(f"{domain}: lite mode links={len(links)}")
+            trace.append(f"{domain}: lite links={len(links)}")
         else:
-            trace.append(f"{domain}: html mode links={len(links)}")
-
+            trace.append(f"{domain}: html links={len(links)}")
         if not links:
-            # homepage fallback lets at least show something non-empty
             links=[f"https://{domain}"]
             trace.append(f"{domain}: fallback homepage")
-
         links=links[:per_domain]
         for url in links:
             try:
                 r=requests.get(url, headers=headers, timeout=timeout)
-                if r.status_code!=200: 
+                if r.status_code!=200:
                     trace.append(f"{domain}: {url} status {r.status_code}")
                     continue
                 soup=BeautifulSoup(r.text,"html.parser")
@@ -628,10 +607,8 @@ def fetch_trusted_snippets(query:str, allowed_domains:List[str], max_snippets:in
             except Exception as e:
                 trace.append(f"{domain}: fetch error {e}")
         if len(out)>=max_snippets: break
-
     st.session_state["web_trace"]="; ".join(trace) if trace else "no trace"
     return out[:max_snippets]
-
 
 # ---------------- Precompute runners + repairs ----------------
 def _run_precompute_inline()->str:
@@ -669,13 +646,12 @@ def _repair_centroids_in_place()->str:
 
 def _build_summaries_fallback(max_lines_per_video: int = 800) -> str:
     """
-    Create video_summaries.json directly from chunks.jsonl (light TF-IDF bullets).
-    This is a last-resort path if your upstream summary job didn't run.
+    Create video_summaries.json from chunks.jsonl (light TF-IDF bullets).
+    Last resort if your upstream summary job didn't run.
     """
     try:
         if not CHUNKS_PATH.exists(): return "chunks.jsonl missing"
         vm = load_video_meta()
-
         texts_by_vid: Dict[str, List[str]] = {}
         ts_by_vid: Dict[str, List[float]] = {}
         with CHUNKS_PATH.open(encoding="utf-8") as f:
@@ -690,10 +666,8 @@ def _build_summaries_fallback(max_lines_per_video: int = 800) -> str:
                 ts = _parse_ts(m.get("start", m.get("start_sec", 0)))
                 texts_by_vid.setdefault(vid, []).append(t)
                 ts_by_vid.setdefault(vid, []).append(float(ts))
-
         vids = list(texts_by_vid.keys())
         if not vids: return "no videos detected in chunks.jsonl"
-
         DF = collections.Counter()
         for vid in vids:
             seen=set()
@@ -706,7 +680,6 @@ def _build_summaries_fallback(max_lines_per_video: int = 800) -> str:
             words=re.findall(r"[a-z0-9]+",t.lower())
             tf=collections.Counter(words)
             return sum(tf[w]*math.log((N+1)/(DF.get(w,1)+0.5)) for w in tf)/(len(words)+1e-6)
-
         summaries={}
         for vid in vids:
             lines=texts_by_vid[vid][:max_lines_per_video]
@@ -721,7 +694,6 @@ def _build_summaries_fallback(max_lines_per_video: int = 800) -> str:
                             "channel":info.get("channel",""),
                             "published_at":info.get("published_at") or info.get("publishedAt") or info.get("date") or "",
                             "bullets":bullets,"summary":summary}
-
         VID_SUM_JSON.parent.mkdir(parents=True, exist_ok=True)
         VID_SUM_JSON.write_text(json.dumps(summaries, ensure_ascii=False, indent=2), encoding="utf-8")
         return f"ok: wrote {VID_SUM_JSON}"
@@ -736,7 +708,6 @@ def _path_exists_report()->Dict[str, Any]:
         "ids": str(VID_IDS_TXT), "ids_exists": VID_IDS_TXT.exists(),
         "summaries": str(VID_SUM_JSON), "summaries_exists": VID_SUM_JSON.exists(),
     }
-
 
 # ---------------- Creator index from chunks ----------------
 def build_creator_indexes_from_chunks(vm: dict) -> tuple[dict, dict]:
@@ -770,7 +741,6 @@ def build_creator_indexes_from_chunks(vm: dict) -> tuple[dict, dict]:
         creator_to_vids.setdefault(canon,set()).add(vid)
     return vid_to_creator, creator_to_vids
 
-
 # ---------------- Verification helper (admin) ----------------
 def scan_chunks_for_terms(terms:List[str], vm:Dict[str,Dict[str,Any]], limit_examples:int=200):
     """Quick coverage scan to see which experts mention the terms."""
@@ -795,7 +765,6 @@ def scan_chunks_for_terms(terms:List[str], vm:Dict[str,Dict[str,Any]], limit_exa
                 examples.append({"video_id":vid,"creator":creator,"ts":_format_ts(st_sec),"snippet":sn})
     per_creator=dict(sorted(per_creator.items(), key=lambda kv:-kv[1]))
     return {"total_matches":total,"per_creator":per_creator,"examples":examples}
-
 
 # ================= UI =================
 st.set_page_config(page_title="Longevity / Nutrition Q&A", page_icon="🍎", layout="wide")
@@ -867,7 +836,6 @@ with st.sidebar:
     st.checkbox("video_meta.json present", value=VIDEO_META_JSON.exists(), disabled=True)
     cent_ready = VID_CENT_NPY.exists() and VID_IDS_TXT.exists() and VID_SUM_JSON.exists()
     st.caption("Video centroids/summaries: ready" if cent_ready else "Precompute not found. Use admin tools.")
-
 
 # Diagnostics area
 if show_diag:
@@ -963,11 +931,9 @@ if _is_admin():
         if scan["examples"]: st.dataframe(scan["examples"], use_container_width=True)
     st.markdown("---")
 
-
 # --------------- Prompt input ---------------
 prompt = st.chat_input("Ask about ApoB/LDL drugs, sleep, protein timing, fasting, supplements, protocols…")
 if prompt is None:
-    # show history sources per turn for transparency
     if st.session_state["turns"]:
         st.subheader("Previous replies and their sources")
         for i, t in enumerate(st.session_state["turns"], 1):
@@ -978,11 +944,12 @@ if prompt is None:
                 if vids:
                     st.markdown("**Video quotes**")
                     for v in vids:
-                        info = load_video_meta().get(v.get("video_id",""),{}) or {}
-                        url = info.get("url","")
-                        hdr = f"- **{v.get('title','')}** — _{v.get('creator','')}_"
-                        st.markdown(f"{hdr}" + (f" — [{url}]({url})" if url else ""))
-                        st.markdown(f"  • **{v.get('ts','')}** — “{_normalize_text(v.get('text',''))[:160]}”")
+                        meta = load_video_meta().get(v.get("video_id",""),{}) or {}
+                        url  = meta.get("url","")
+                        header = f"- **{v.get('title','')}** — _{v.get('creator','')}_ • {v.get('ts','')}"
+                        st.markdown(f"{header}")
+                        st.markdown(f"  • “{_normalize_text(v.get('text',''))[:160]}”")
+                        if url: st.caption(url)
                 if web:
                     st.markdown("**Trusted websites**")
                     for j, s in enumerate(web, 1):
@@ -1022,7 +989,6 @@ allowed_vids = {vid for vid in universe if vid_to_creator.get(vid) in chosen}
 
 # Stage A routing with light follow-up context
 routing_query = prompt
-# include previous user message lightly to help follow-ups without polluting too much
 prev_users = [m["content"] for m in st.session_state.messages if m["role"]=="user"]
 if len(prev_users) >= 2:
     routing_query = prev_users[-2] + " ; " + prompt
@@ -1035,9 +1001,10 @@ half_life_auto = 270
 routed_vids = route_videos_by_summary(
     routing_query, qv, summaries, vm, C, list(universe), allowed_vids,
     topK=topK_route, recency_weight=recency_weight_auto, half_life_days=half_life_auto,
-    min_kw_overlap=2
+    min_kw_overlap=1
 )
 candidate_vids = set(routed_vids) if routed_vids else allowed_vids
+st.session_state["routing_debug"] = {"routed_vids": list(routed_vids), "routed_count": len(routed_vids), "allowed_count": len(allowed_vids)}
 
 # Auto recall defaults (overridable in Advanced)
 K_scan = st.session_state.get("adv_scanK", 768)
@@ -1062,6 +1029,20 @@ with st.spinner("Scanning selected videos…"):
     except Exception as e:
         with st.chat_message("assistant"):
             st.error("Search failed."); st.exception(e); st.stop()
+
+# ---- FAIL-SAFE: widen if we got no quotes from routed videos
+if not hits:
+    candidate_vids_fallback = allowed_vids  # full expert universe
+    with st.spinner("Widening search across all selected experts…"):
+        hits = stageB_search_chunks(
+            prompt, index, embedder, candidate_vids_fallback,
+            initial_k=min(max(int(K_scan)*2, 1024), index.ntotal if index is not None else 2048),
+            final_k=int(max(K_use, 36)),
+            max_videos=int(max(max_videos, 5)),
+            per_video_cap=int(max(per_video_cap, 4)),
+            apply_mmr=bool(use_mmr), mmr_lambda=float(mmr_lambda),
+            recency_weight=float(recency_weight), half_life_days=float(half_life), vm=vm
+        )
 
 # Web support (up to 3, 1 per domain)
 web_snips=[]
@@ -1094,38 +1075,47 @@ with st.chat_message("assistant"):
         "answer": ans,
         "videos": export_struct["videos"],
         "web": web_snips,
-        "web_trace": st.session_state.get("web_trace","")
+        "web_trace": st.session_state.get("web_trace",""),
+        "routing_debug": st.session_state.get("routing_debug",{})
     })
 
     # Sources UI for this reply
     with st.expander("Sources for this reply", expanded=False):
-        st.caption("Each bullet shows a timestamped quote pulled from a routed video. Websites are supporting references.")
+        st.caption("Each bullet shows a timestamped quote pulled from a routed video. Websites appear as supporting references.")
         vids = export_struct["videos"]
-        if vids:
-            # group by video_id for neat display
-            by_vid={}; 
-            for v in vids: by_vid.setdefault(v["video_id"], []).append(v)
-            order = list(by_vid.keys())
-            for vid in order:
-                info = vm.get(vid, {})
-                title = info.get("title") or by_vid[vid][0].get("title","")
-                creator = by_vid[vid][0].get("creator","")
-                url = info.get("url") or ""
-                header = f"- **{title}**" + (f" — _{creator}_" if creator else "")
-                st.markdown(f"{header}" + (f" — [{url}]({url})" if url else ""))
-                for q in by_vid[vid]:
-                    ts=q.get("ts",""); qt=_normalize_text(q.get("text",""))
-                    if len(qt)>160: qt=qt[:160]+"…"
-                    st.markdown(f"  • **{ts}** — “{qt}”")
+        if not vids:
+            st.warning("No timestamped video quotes passed the relevance filter for this turn. The answer may rely on web support.")
+        else:
+            # group by video for clean display
+            by_vid={}
+            for v in vids:
+                by_vid.setdefault(v["video_id"], {"meta":v, "quotes":[]})
+                by_vid[v["video_id"]]["quotes"].append(v)
+            for vid, bundle in by_vid.items():
+                meta = vm.get(vid, {}) or {}
+                title = bundle["meta"]["title"]
+                creator = bundle["meta"]["creator"]
+                url = meta.get("url","")
+                header = f"**{title}** — _{creator}_"
+                st.markdown(f"- [{header}]({url})" if url else f"- {header}")
+                for q in bundle["quotes"]:
+                    st.markdown(f"  • **{q['ts']}** — “{_normalize_text(q['text'])[:160]}”")
+
         if web_snips:
             st.markdown("**Trusted websites**")
             for j, s in enumerate(web_snips, 1):
                 st.markdown(f"W{j}. [{s['domain']}]({s['url']})")
-        if st.session_state.get("web_trace"):
-            st.caption(f"Web fetch: enabled={bool(allow_web)} trace={st.session_state.get('web_trace')}")
+
+        # routing + web debug
+        dbg = st.session_state.get("routing_debug", {})
+        if dbg:
+            st.caption(f"Routing: picked {dbg.get('routed_count',0)} of {dbg.get('allowed_count',0)} allowed videos.")
+        wtrace = st.session_state.get("web_trace","")
+        if wtrace:
+            st.caption(f"Web fetch: {wtrace}")
 
 # Footer + Clear chat
-st.caption("Routing uses summary bullets + centroids with keyword overlap; diversified quotes are fused with trusted medical sites.")
+st.caption("Auto routing selects top videos, then diversified quotes are fused with supporting medical sites. Use Clear chat to start a new question thread.")
 cols=st.columns([1]*12)
 with cols[-1]:
     st.button("Clear chat", key="clear_done", on_click=_clear_chat)
