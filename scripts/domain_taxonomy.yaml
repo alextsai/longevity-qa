@@ -1,0 +1,12 @@
+labels:
+  cardio:        ["apob","apo-b","ldl","hdl","triglyceride","statin","ezetimibe","pcsk9","bempedoic","inclisiran","lp(a)","coronary","cabg","stent","plaque","atherosclerosis","angina","ischemia"]
+  sleep:         ["sleep","insomnia","melatonin","glycine","magnesium","sleep latency","circadian","rem","deep sleep","hrv","chronotype"]
+  insulin:       ["insulin","glucose","cgm","a1c","homa","metformin","berberine","glycemic","hyperinsulinemia","prediabetes"]
+  weight:        ["obesity","overweight","weight loss","glp-1","semaglutide","tirzepatide","leptin","ghrelin","calorie","deficit","satiety"]
+  gut:           ["microbiome","probiotic","prebiotic","fiber","butyrate","ibs","fodmap","colon","bowel","dysbiosis","fermented"]
+  bones:         ["osteoporosis","bone density","dexa","calcium","vitamin d","bisphosphonate","alendronate","denosumab","fracture"]
+  supplements:   ["supplement","vitamin","mineral","coq10","omega-3","creatine","curcumin","resveratrol","quercetin","ashwagandha"]
+  training:      ["resistance","hypertrophy","strength","endurance","vo2","zone 2","protein timing","reps","sets","rpe"]
+  neuro:         ["cognition","alzheimer","parkinson","memory","focus","adhd","dopamine","serotonin","neurodegeneration"]
+  longevity:     ["longevity","lifespan","healthspan","mtor","autophagy","rapamycin","senolytic","caloric restriction","cr"]
+  nutrition:     ["diet","nutrition","protein","carbohydrate","fat","fiber","whole grain","legume","fruit","vegetable","sodium","potassium","saturated fat","trans fat","polyunsaturated","monounsaturated","omega-3","omega-6","glycemic index","glycemic load","sugar","fructose","added sugar","polyphenol","antioxidant","mediterranean","dash"]
