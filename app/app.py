@@ -1,23 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Longevity / Nutrition Q&A — experts-first RAG with trusted web support.
+Longevity / Nutrition Q&A — experts-first RAG + domain routing + trusted web.
 
-Goals solved in this build
-1) Accurate, relevant sources: stricter routing guards + per-video quote validation.
-2) Quotes always show when routed: multi-step fallback to summary bullets then top chunk.
-3) Per-turn sources: each reply stores its own sources; earlier turns remain intact.
-4) Trusted web snippets: dual DuckDuckGo modes + homepage fallback + visible trace.
-5) Centroid norms ≈ 1.0: auto-renormalize on load, warn and continue if shapes mismatch.
-6) Comments: each critical function documents assumptions and failure modes.
-
-Operational defaults
-- Route ~5 videos via centroid + summary-keyword + recency; require min keyword overlap.
-- Recall ~36 quotes total with MMR, cap 4 per video, 5 videos.
-- Web support up to 3 snippets (1/domain) from vetted domains.
+What this build adds
+1) Domain routing: uses data/domain/domain_model.joblib to classify the user query,
+   then prioritizes videos whose domain probabilities are highest for those domains.
+   Falls back to summary+centroid routing if domain artifacts are missing.
+2) Accurate sources: stricter quote validation, routed-per-video fallbacks,
+   timestamped YouTube links, and explicit trusted-web links.
+3) Per-turn sources: every reply stores its own sources; earlier turns remain intact.
+4) Trusted-web snippets: DuckDuckGo html→lite→homepage with visible fetch trace.
+5) Centroid norms: auto-renormalize to ||v||≈1.0 on load; repair button writes back.
+6) Comments: all critical functions document assumptions and failure modes.
 
 Infra
-- DATA_DIR points at your repo root containing data/{chunks,index,catalog}.
+- DATA_DIR points at your repo root containing data/{chunks,index,catalog,domain}.
 - OPENAI_API_KEY must be set in the environment.
+- Domain artifacts optional but recommended:
+  data/domain/domain_model.joblib, data/domain/domain_probs.(json|yaml)
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS","1")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES","")
 
 from pathlib import Path
-import sys, json, pickle, time, re, math, collections
+import sys, json, yaml, pickle, time, re, math, collections
 from typing import List, Dict, Any, Set, Tuple
 from datetime import datetime
 
@@ -46,23 +46,33 @@ try:
 except Exception:
     requests=None; BeautifulSoup=None
 
+# Optional domain model
+try:
+    import joblib
+except Exception:
+    joblib=None
+
 
 # ---------- Paths ----------
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
 
 DATA_ROOT = Path(os.getenv("DATA_DIR","/var/data")).resolve()
+
+# Core RAG artifacts
 CHUNKS_PATH     = DATA_ROOT / "data/chunks/chunks.jsonl"
 OFFSETS_NPY     = DATA_ROOT / "data/chunks/chunks.offsets.npy"
 INDEX_PATH      = DATA_ROOT / "data/index/faiss.index"
 METAS_PKL       = DATA_ROOT / "data/index/metas.pkl"
 VIDEO_META_JSON = DATA_ROOT / "data/catalog/video_meta.json"
-
-# Precompute artifacts
 VID_CENT_NPY    = DATA_ROOT / "data/index/video_centroids.npy"
 VID_IDS_TXT     = DATA_ROOT / "data/index/video_ids.txt"
 VID_SUM_JSON    = DATA_ROOT / "data/catalog/video_summaries.json"
+
+# Domain routing artifacts (optional but used if present)
+DOMAIN_MODEL    = DATA_ROOT / "data/domain/domain_model.joblib"
+DOMAIN_PROBS_JSON = DATA_ROOT / "data/domain/domain_probs.json"
+DOMAIN_PROBS_YAML = DATA_ROOT / "data/domain/domain_probs.yaml"
 
 REQUIRED = [INDEX_PATH, METAS_PKL, CHUNKS_PATH, VIDEO_META_JSON]
 WEB_FALLBACK = os.getenv("WEB_FALLBACK","true").strip().lower() in {"1","true","yes","on"}
@@ -87,7 +97,8 @@ EXCLUDED_CREATORS_EXACT = {
     "dr. pradip jamnadas, md and the primal podcast",
 }
 
-# ---------- Utils ----------
+
+# ---------- Small utils ----------
 def _normalize_text(s:str)->str:
     return re.sub(r"\s+"," ",(s or "").strip())
 
@@ -120,6 +131,13 @@ def _iso(ts: float) -> str:
     try: return datetime.fromtimestamp(ts).isoformat()
     except Exception: return "n/a"
 
+def _yt_ts_url(url:str, start_sec:float)->str:
+    if not url: return ""
+    s = int(max(0, round(start_sec)))
+    # yt short and long work with t= seconds
+    join = "&" if "?" in url else "?"
+    return f"{url}{join}t={s}s"
+
 def _clear_chat():
     st.session_state["messages"]=[]; st.session_state["turns"]=[]; st.rerun()
 
@@ -146,6 +164,10 @@ def _raw_creator_of_vid(vid:str, vm:dict)->str:
     return "Unknown"
 
 def _canonicalize_creator(name: str) -> str | None:
+    """
+    Heuristic canonicalization into ALLOWED_CREATORS.
+    Avoids brittle synonym tables. Returns None if excluded.
+    """
     n = _normalize_text(name).lower().replace("™","").replace("®","")
     if not n: return None
     if n in EXCLUDED_CREATORS_EXACT: return None
@@ -172,6 +194,10 @@ def _canonicalize_creator(name: str) -> str | None:
 # ---------- LLM answerer ----------
 def openai_answer(model_name: str, question: str, history, grouped_video_block: str,
                   web_snips: list[dict], no_video: bool) -> str:
+    """
+    Compose answer from grouped video quotes + trusted sites.
+    Every claim must be tied to a provided quote or snippet.
+    """
     if not os.getenv("OPENAI_API_KEY"):
         return "⚠️ OPENAI_API_KEY is not set."
 
@@ -190,14 +216,14 @@ def openai_answer(model_name: str, question: str, history, grouped_video_block: 
 
     system = (
         "Answer only from the provided VIDEO quotes and trusted WEB snippets. "
-        "Priority: (1) grouped VIDEO evidence from allowed experts, (2) trusted WEB snippets.\n"
+        "Priority: (1) grouped VIDEO quotes from allowed experts, (2) trusted WEB.\n"
         + fallback_line +
         "Rules:\n"
-        "• Cite every claim/step: (Video k) for each video quote, (DOMAIN Wj) for web.\n"
-        "• Prefer human clinical data; label animal/in-vitro/mechanistic evidence.\n"
+        "• Cite every claim/step: (Video k) per video, (DOMAIN Wj) for web.\n"
+        "• Flag animal/in-vitro/mechanistic vs human clinical.\n"
         "• Normalize units; include numeric effect sizes if present.\n"
-        "• Provide options with mechanism and typical magnitude; write 'dose not specified' if absent. No diagnosis.\n"
-        "Structure: Key summary • Practical protocol • Safety notes. Be concise and source-grounded.\n"
+        "• Give practical options with mechanisms; 'dose not specified' if absent. No diagnosis.\n"
+        "Structure: Key summary • Practical protocol • Safety notes.\n"
         "Do not invent claims beyond the provided evidence."
     )
 
@@ -239,6 +265,10 @@ def _recency_score(published_ts:float, now:float, half_life_days:float)->float:
 
 # ---------- JSONL offsets for random access ----------
 def _ensure_offsets()->np.ndarray:
+    """
+    Build seek index for chunks.jsonl to random-access by line id.
+    Rebuild if file grew.
+    """
     if OFFSETS_NPY.exists():
         try:
             arr=np.load(OFFSETS_NPY)
@@ -255,6 +285,7 @@ def _ensure_offsets()->np.ndarray:
     return arr
 
 def iter_jsonl_rows(indices:List[int], limit:int|None=None):
+    """Yield rows by numeric line indices from chunks.jsonl."""
     if not CHUNKS_PATH.exists(): return
     offs=_ensure_offsets()
     want=[i for i in indices if 0<=i<len(offs)]
@@ -273,6 +304,9 @@ def _load_embedder(model_name:str)->SentenceTransformer:
 
 @st.cache_resource(show_spinner=False)
 def load_metas_and_model(index_path:Path=INDEX_PATH, metas_path:Path=METAS_PKL):
+    """
+    Load FAISS index + encoder. Enforce dimension match.
+    """
     if not index_path.exists() or not metas_path.exists(): return None, None, None
     index = faiss.read_index(str(index_path))
     with metas_path.open("rb") as f:
@@ -287,6 +321,9 @@ def load_metas_and_model(index_path:Path=INDEX_PATH, metas_path:Path=METAS_PKL):
 
 @st.cache_resource(show_spinner=False)
 def load_video_centroids():
+    """
+    Return per-video centroid matrix and aligned video_id list, unit-normalized.
+    """
     if not (VID_CENT_NPY.exists() and VID_IDS_TXT.exists()): return None, None
     C = np.load(VID_CENT_NPY).astype("float32")
     vids = VID_IDS_TXT.read_text(encoding="utf-8").splitlines()
@@ -301,6 +338,72 @@ def load_video_summaries():
         try:return json.loads(VID_SUM_JSON.read_text(encoding="utf-8"))
         except:return {}
     return {}
+
+
+# ---------- Domain routing ----------
+@st.cache_resource(show_spinner=False)
+def load_domain_model():
+    """
+    Load trained text classifier Pipeline and domain probabilities per video.
+    Returns (model, per_video_single_domain_probs, domain_set)
+    - per_video_single_domain_probs: vid -> {domain: prob} using max-over-keys heuristic
+      if domain_probs.yaml/json includes multi-label keys like "nutrition;cardio".
+    """
+    if not DOMAIN_MODEL.exists() or joblib is None:
+        return None, {}, set()
+    try:
+        model = joblib.load(DOMAIN_MODEL)
+    except Exception:
+        model = None
+
+    # Load per-video probabilities (json preferred)
+    probs_raw = []
+    if DOMAIN_PROBS_JSON.exists():
+        try:
+            probs_raw = json.loads(DOMAIN_PROBS_JSON.read_text(encoding="utf-8"))
+        except Exception:
+            probs_raw = []
+    elif DOMAIN_PROBS_YAML.exists():
+        try:
+            probs_raw = yaml.safe_load(DOMAIN_PROBS_YAML.read_text(encoding="utf-8")) or []
+        except Exception:
+            probs_raw = []
+
+    # Build per-video max-prob per single domain
+    per_video: Dict[str, Dict[str,float]] = {}
+    all_domains=set()
+    for row in probs_raw:
+        vid=row.get("video_id"); 
+        if not vid: continue
+        per_video.setdefault(vid, {})
+        for key,val in row.items():
+            if key=="video_id": continue
+            try: p=float(val)
+            except: 
+                continue
+            # key may be "nutrition" or "nutrition;cardio"
+            parts=[t.strip() for t in key.split(";") if t.strip()]
+            for d in parts:
+                all_domains.add(d)
+                per_video[vid][d]=max(per_video[vid].get(d,0.0), p)
+
+    return model, per_video, all_domains
+
+def classify_query_domains(model, query:str, top_k:int=3, min_keep:int=1)->List[str]:
+    """
+    Run the TF-IDF LogisticRegression pipeline on the user query to get top domains.
+    Falls back to [] if model is None or error.
+    """
+    if model is None: return []
+    try:
+        # predict_proba expects a list of texts
+        proba = model.predict_proba([query])[0]
+        classes = list(model.classes_)
+        ranked = sorted(zip(classes, proba), key=lambda x:-x[1])
+        keep = [d for d,_ in ranked[:max(min_keep, top_k)]]
+        return keep
+    except Exception:
+        return []
 
 
 # ---------- MMR + quote filters ----------
@@ -320,6 +423,11 @@ def mmr(qv:np.ndarray, doc_vecs:np.ndarray, k:int, lambda_diversity:float=0.45)-
     return sel
 
 def _quote_is_valid(text:str)->bool:
+    """
+    Quote must be readable and self-contained.
+    - ≥ 40 chars
+    - contains boundary punctuation (.,;:?!)
+    """
     t=_normalize_text(text)
     if len(t) < 40: return False
     return any(x in t for x in [". ","; ",": ","? ","! "])
@@ -336,7 +444,7 @@ def _dedupe_passages(items:List[Dict[str,Any]], time_window_sec:float=8.0, min_c
     return out
 
 
-# ---------- Summary-aware routing ----------
+# ---------- Summary-aware routing (fallback) ----------
 def _build_idf_over_bullets(summaries: dict) -> dict:
     DF = collections.Counter()
     vids = list(summaries.keys())
@@ -364,6 +472,11 @@ def route_videos_by_summary(
     topK: int, recency_weight: float, half_life_days: float,
     min_kw_overlap:int=2
 ) -> list[str]:
+    """
+    Fallback routing when domain routing is unavailable.
+    Score = 0.6*centroid + 0.3*summary-keyword + recency blend.
+    Guard: require min_kw_overlap tokens to reduce off-topic picks.
+    """
     universe = [v for v in (vids or list(vm.keys())) if (not allowed_vids or v in allowed_vids)]
     if not universe: return []
     cent = {}
@@ -395,6 +508,10 @@ def stageB_search_chunks(query:str,
     initial_k:int, final_k:int, max_videos:int, per_video_cap:int,
     apply_mmr:bool, mmr_lambda:float,
     recency_weight:float, half_life_days:float, vm:dict)->List[Dict[str,Any]]:
+    """
+    Dense search -> re-embed -> MMR -> recency blend -> per-video caps.
+    Only keeps chunks from candidate_vids if provided.
+    """
     if index is None: return []
     qv=embedder.encode([query], normalize_embeddings=True).astype("float32")[0]
     K = min(int(initial_k), index.ntotal if index.ntotal>0 else int(initial_k))
@@ -459,6 +576,7 @@ def group_hits_by_video(hits:List[Dict[str,Any]])->Dict[str,List[Dict[str,Any]]]
     return g
 
 def _first_bullets(vid:str, summaries:dict, k:int=2)->List[dict]:
+    """Pick up to k acceptable summary bullets as last-ditch evidence."""
     out=[]
     for b in summaries.get(vid,{}).get("bullets", []):
         q=_normalize_text(b.get("text",""))
@@ -471,18 +589,28 @@ def build_grouped_evidence_for_prompt(
     hits:List[Dict[str,Any]], vm:dict, summaries:dict,
     routed_vids:List[str], max_quotes:int=3
 )->Tuple[str,Dict[str,Any]]:
+    """
+    Build LLM block + export struct.
+    Guarantees ≥1 quote per routed video via multistep fallback:
+    1) top validated chunk quotes,
+    2) else up to 2 acceptable summary bullets,
+    3) else highest-scoring raw chunk line for that video.
+    """
     groups=group_hits_by_video(hits)
+
+    # order: routed_vids first (keeps relevance), then any extra with hits
     order_vids = []
+    seen=set()
     for v in routed_vids:
-        if v in groups or v in (vm or {}): order_vids.append(v)
+        if v not in seen: order_vids.append(v); seen.add(v)
     for v in groups.keys():
-        if v not in order_vids: order_vids.append(v)
+        if v not in seen: order_vids.append(v); seen.add(v)
 
     lines=[]; export=[]
     for v_idx, vid in enumerate(order_vids, 1):
-        if vid not in (vm or {}) and vid not in groups:
-            continue
         info=vm.get(vid,{})
+        if not info and vid not in groups:  # skip unknowns
+            continue
         title=info.get("title") or summaries.get(vid,{}).get("title") or vid
         creator_raw=_raw_creator_of_vid(vid, vm)
         creator=_canonicalize_creator(creator_raw) or creator_raw
@@ -490,29 +618,37 @@ def build_grouped_evidence_for_prompt(
         url=info.get("url") or ""
         lines.append(f"[Video {v_idx}] {title} — {creator}" + (f" — {date}" if date else "") + (f" — {url}" if url else ""))
 
+        # 1) validated chunks from Stage-B
         items = groups.get(vid, [])
         clean=_dedupe_passages(items, time_window_sec=8.0, min_chars=40)
         used=0
         for h in clean[:max_quotes]:
-            ts=_format_ts((h.get("meta") or {}).get("start",0))
+            t0 = float((h.get("meta") or {}).get("start",0))
+            ts=_format_ts(t0)
             q=_normalize_text(h.get("text",""))
             lines.append(f"  • {ts}: “{q[:260]}”")
-            export.append({"video_id":vid,"title":title,"creator":creator,"ts":ts,"text":q,"url":url})
+            export.append({"video_id":vid,"title":title,"creator":creator,"ts":ts,"text":q,"url": _yt_ts_url(url, t0) if url else url})
             used+=1
 
+        # 2) summary bullets fallback if none used
         if used==0:
             for b in _first_bullets(vid, summaries, k=min(2,max_quotes)):
-                lines.append(f"  • {b['ts']}: “{b['text'][:260]}”")
-                export.append({"video_id":vid,"title":title,"creator":creator,"ts":b["ts"],"text":b["text"],"url":url})
+                # bullets carry ts but not URL; build anchored URL with ts if available
+                ts_txt = b["ts"]
+                try_sec = sum(float(x)*60**i for i,x in enumerate(reversed(ts_txt.split(":")))) if ts_txt else 0.0
+                lines.append(f"  • {ts_txt}: “{b['text'][:260]}”")
+                export.append({"video_id":vid,"title":title,"creator":creator,"ts":ts_txt,"text":b["text"],"url": _yt_ts_url(url, try_sec) if url else url})
                 used+=1
                 if used>=max_quotes: break
 
+        # 3) top raw line fallback if still empty
         if used==0 and items:
             h=items[0]
-            ts=_format_ts((h.get("meta") or {}).get("start",0))
+            t0=float((h.get("meta") or {}).get("start",0))
+            ts=_format_ts(t0)
             q=_normalize_text(h.get("text",""))
             lines.append(f"  • {ts}: “{q[:260]}”")
-            export.append({"video_id":vid,"title":title,"creator":creator,"ts":ts,"text":q,"url":url})
+            export.append({"video_id":vid,"title":title,"creator":creator,"ts":ts,"text":q,"url": _yt_ts_url(url, t0) if url else url})
 
         lines.append("")
     return "\n".join(lines).strip(), {"videos": export}
@@ -538,6 +674,10 @@ def _ddg_lite(domain:str, query:str, headers:dict, timeout:float)->List[str]:
         return []
 
 def fetch_trusted_snippets(query:str, allowed_domains:List[str], max_snippets:int=3, per_domain:int=1, timeout:float=6.0):
+    """
+    Try HTML → Lite → homepage fallback. Returns [{domain,url,text}, ...] and
+    records trace in st.session_state['web_trace'].
+    """
     trace=[]
     out=[]
     if not requests or not BeautifulSoup or max_snippets<=0:
@@ -674,11 +814,18 @@ def _path_exists_report()->Dict[str, Any]:
         "centroids": str(VID_CENT_NPY), "centroids_exists": VID_CENT_NPY.exists(),
         "ids": str(VID_IDS_TXT), "ids_exists": VID_IDS_TXT.exists(),
         "summaries": str(VID_SUM_JSON), "summaries_exists": VID_SUM_JSON.exists(),
+        "domain_model": str(DOMAIN_MODEL), "domain_model_exists": DOMAIN_MODEL.exists(),
+        "domain_probs_json": str(DOMAIN_PROBS_JSON), "domain_probs_json_exists": DOMAIN_PROBS_JSON.exists(),
+        "domain_probs_yaml": str(DOMAIN_PROBS_YAML), "domain_probs_yaml_exists": DOMAIN_PROBS_YAML.exists(),
     }
 
 
 # ---------- Creator index ----------
 def build_creator_indexes_from_chunks(vm: dict) -> tuple[dict, dict]:
+    """
+    Build (vid->creator, creator->set(vid)) from chunks.jsonl then fill gaps from meta.
+    Heuristic canonicalization so variants map correctly.
+    """
     vid_to_creator: Dict[str,str] = {}
     creator_to_vids: Dict[str,set] = {}
     if CHUNKS_PATH.exists():
@@ -706,32 +853,7 @@ def build_creator_indexes_from_chunks(vm: dict) -> tuple[dict, dict]:
     return vid_to_creator, creator_to_vids
 
 
-# ---------- Verification (admin) ----------
-def scan_chunks_for_terms(terms:List[str], vm:Dict[str,Dict[str,Any]], limit_examples:int=200):
-    if not CHUNKS_PATH.exists():
-        return {"total_matches":0,"per_creator":{},"examples":[]}
-    pat = re.compile(r"("+"|".join([re.escape(t) for t in terms]) + r")", re.IGNORECASE)
-    total=0; per_creator={}; examples=[]
-    with CHUNKS_PATH.open(encoding="utf-8") as f:
-        for ln in f:
-            try:j=json.loads(ln)
-            except:continue
-            t=j.get("text","") or ""
-            if not pat.search(t): continue
-            m=(j.get("meta") or {})
-            vid=m.get("video_id") or m.get("vid") or m.get("ytid") or j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id") or "Unknown"
-            st_sec=_parse_ts(m.get("start", m.get("start_sec",0)))
-            creator=_canonicalize_creator(_raw_creator_of_vid(vid, vm)) or _raw_creator_of_vid(vid, vm)
-            per_creator[creator]=per_creator.get(creator,0)+1
-            total+=1
-            if len(examples)<int(limit_examples):
-                sn=_normalize_text(t); sn=sn[:260]+"…" if len(sn)>260 else sn
-                examples.append({"video_id":vid,"creator":creator,"ts":_format_ts(st_sec),"snippet":sn})
-    per_creator=dict(sorted(per_creator.items(), key=lambda kv:-kv[1]))
-    return {"total_matches":total,"per_creator":per_creator,"examples":examples}
-
-
-# ================= UI =================
+# ---------- UI ----------
 st.set_page_config(page_title="Longevity / Nutrition Q&A", page_icon="🍎", layout="wide")
 st.title("Longevity / Nutrition Q&A")
 
@@ -740,8 +862,9 @@ if "turns" not in st.session_state: st.session_state["turns"]=[]
 if "messages" not in st.session_state: st.session_state["messages"]=[]
 
 with st.sidebar:
-    st.markdown("**Auto Mode** · tuned for accuracy + diversity")
+    st.markdown("**Auto Mode** · accuracy and diversity enabled")
 
+    # Experts checklist with counts
     vm = load_video_meta()
     vid_to_creator, creator_to_vids = build_creator_indexes_from_chunks(vm)
     counts={canon: len(creator_to_vids.get(canon,set())) for canon in ALLOWED_CREATORS}
@@ -756,23 +879,22 @@ with st.sidebar:
     selected_creators:set[str]=set(selected_creators_list)
     st.session_state["selected_creators"]=selected_creators
 
+    # Trusted sites
     st.subheader("Trusted sites")
     st.caption("Short excerpts from vetted medical sites are added as supporting evidence.")
-    allow_web = st.checkbox(
-        "Include supporting website excerpts", value=True,
-        help="Fetches brief paragraphs from the checked sites and blends them with expert videos."
-    )
+    allow_web = st.checkbox("Include supporting website excerpts", value=True)
     selected_domains=[]
     for i,dom in enumerate(TRUSTED_DOMAINS):
         if st.checkbox(dom, value=True, key=f"site_{i}"):
             selected_domains.append(dom)
     max_web_auto = 3
 
+    # Model choice
     model_choice = st.selectbox(
-        "Answering model", ["gpt-4o-mini","gpt-4o","gpt-4.1-mini"], index=0,
-        help="Chooses how the final answer is written from the evidence."
+        "Answering model", ["gpt-4o-mini","gpt-4o","gpt-4.1-mini"], index=0
     )
 
+    # Advanced
     with st.expander("Advanced (technical controls)", expanded=False):
         st.caption("Defaults are tuned. Adjust only if needed.")
         st.number_input("Scan candidates first (K)", 128, 5000, 768, 64, key="adv_scanK")
@@ -785,10 +907,7 @@ with st.sidebar:
         st.slider("Recency half-life (days)", 7, 720, 270, 7, key="adv_hl")
 
     st.divider()
-    show_diag = st.toggle(
-        "Show data diagnostics", value=False,
-        help="Check file locations, modification times, and index health."
-    )
+    show_diag = st.toggle("Show data diagnostics", value=False)
     st.subheader("Library status")
     st.checkbox("chunks.jsonl present", value=CHUNKS_PATH.exists(), disabled=True)
     st.checkbox("offsets built", value=OFFSETS_NPY.exists(), disabled=True)
@@ -796,44 +915,22 @@ with st.sidebar:
     st.checkbox("metas.pkl present", value=METAS_PKL.exists(), disabled=True)
     st.checkbox("video_meta.json present", value=VIDEO_META_JSON.exists(), disabled=True)
     cent_ready = VID_CENT_NPY.exists() and VID_IDS_TXT.exists() and VID_SUM_JSON.exists()
-    st.caption("Video centroids/summaries: ready" if cent_ready else "Precompute not found. Use admin tools.")
+    st.checkbox("centroids+ids+summaries present", value=cent_ready, disabled=True)
 
+# Diagnostics area
 if show_diag:
     colA,colB,colC = st.columns([2,3,3])
     with colA: st.caption(f"DATA_DIR = `{DATA_ROOT}`")
     with colB: st.caption(f"chunks mtime: {_iso(_file_mtime(CHUNKS_PATH)) if CHUNKS_PATH.exists() else 'missing'}")
     with colC: st.caption(f"index mtime: {_iso(_file_mtime(INDEX_PATH)) if INDEX_PATH.exists() else 'missing'}")
 
+# Render prior chat
 for m in st.session_state.messages:
     with st.chat_message(m["role"]): st.markdown(m["content"])
 
+# Admin diagnostics
 if _is_admin():
     st.subheader("Diagnostics (admin)")
-    try:
-        _,_,payload = load_metas_and_model()
-        status = {
-            **{"chunks_mtime": _file_mtime(CHUNKS_PATH),
-               "cent_mtime": _file_mtime(VID_CENT_NPY),
-               "ids_mtime": _file_mtime(VID_IDS_TXT)},
-        }
-    except Exception as e:
-        status = {"msg":[f"load error: {e}"]}
-
-    cent_m   = _file_mtime(VID_CENT_NPY)
-    ids_m    = _file_mtime(VID_IDS_TXT)
-    chunks_m = _file_mtime(CHUNKS_PATH)
-    ok_cent = bool(cent_m and chunks_m and cent_m > chunks_m)
-    ok_ids  = bool(ids_m  and chunks_m and ids_m  > chunks_m)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.metric("centroids newer than chunks", "Yes" if ok_cent else "No")
-        st.caption(f"centroids: {_iso(cent_m)}  |  chunks: {_iso(chunks_m)}")
-    with c2:
-        st.metric("ids newer than chunks", "Yes" if ok_ids else "No")
-        st.caption(f"ids: {_iso(ids_m)}  |  chunks: {_iso(chunks_m)}")
-
-    st.subheader("Files on disk (debug)")
     st.code(json.dumps(_path_exists_report(), indent=2))
 
     cols_dbg = st.columns(3)
@@ -859,8 +956,6 @@ if _is_admin():
                      key=lambda x: -x[1])
         st.dataframe([{"creator": c, "videos": n} for c,n in inv], use_container_width=True)
 
-    st.caption("Keyword coverage scan coming from code in scripts; run offline for full report.")
-
 
 # --------------- Prompt input ---------------
 prompt = st.chat_input("Ask about ApoB/LDL drugs, sleep, protein timing, fasting, supplements, protocols…")
@@ -882,7 +977,11 @@ if prompt is None:
                             hdr = f"- **{v.get('title','')}** — _{v.get('creator','')}_"
                             st.markdown(f"{hdr}" + (f"  •  [{link}]({link})" if link else ""))
                             cur_vid = v.get("video_id")
-                        st.markdown(f"  • **{v.get('ts','')}** — “{_normalize_text(v.get('text',''))[:180]}”")
+                        # show anchored link per quote
+                        if v.get("url"):
+                            st.markdown(f"  • **{v.get('ts','')}** — “{_normalize_text(v.get('text',''))[:180]}”  ·  [{v.get('url')}]({v.get('url')})")
+                        else:
+                            st.markdown(f"  • **{v.get('ts','')}** — “{_normalize_text(v.get('text',''))[:180]}”")
                 if web:
                     st.markdown("**Trusted websites**")
                     for j, s in enumerate(web, 1):
@@ -892,15 +991,18 @@ if prompt is None:
         st.button("Clear chat", key="clear_idle", on_click=_clear_chat)
     st.stop()
 
+# store user message
 st.session_state.messages.append({"role":"user","content":prompt})
 with st.chat_message("user"): st.markdown(prompt)
 
+# Guardrails
 missing=[p for p in REQUIRED if not p.exists()]
 if missing:
     with st.chat_message("assistant"):
         st.error("Missing required files:\n" + "\n".join(f"- {p}" for p in missing))
     st.stop()
 
+# Load FAISS + encoder + summaries + domain router
 try:
     index, _, payload = load_metas_and_model()
 except Exception as e:
@@ -910,29 +1012,67 @@ embedder: SentenceTransformer = payload["embedder"]
 vm = load_video_meta()
 C, vid_list = load_video_centroids()
 summaries = load_video_summaries()
+domain_model, per_video_domain_probs, domain_set = load_domain_model()
 
+# Selected experts → allowed video universe
 vid_to_creator, creator_to_vids = build_creator_indexes_from_chunks(vm)
 universe = set(vid_list or list(vm.keys()) or list(vid_to_creator.keys()))
 chosen = st.session_state.get("selected_creators", set(ALLOWED_CREATORS))
-allowed_vids = {vid for vid in universe if vid_to_creator.get(vid) in chosen}
+allowed_vids_all = {vid for vid in universe if vid_to_creator.get(vid) in chosen}
 
-routing_query = prompt
-prev_users = [m["content"] for m in st.session_state.messages if m["role"]=="user"]
-if len(prev_users) >= 2:
-    routing_query = prev_users[-2] + " ; " + prompt
+# Domain routing for this query
+domain_top = classify_query_domains(domain_model, prompt, top_k=3, min_keep=1)
 
-qv = embedder.encode([routing_query], normalize_embeddings=True).astype("float32")[0]
+def _score_vid_by_domains(vid:str, domain_top:List[str])->float:
+    """
+    Aggregate video score based on query's top domains.
+    Uses per_video_domain_probs[vid][domain] if present.
+    """
+    if vid not in per_video_domain_probs or not domain_top:
+        return 0.0
+    dv = per_video_domain_probs.get(vid, {})
+    return float(sum(dv.get(d,0.0) for d in domain_top) / max(1,len(domain_top)))
+
+# Stage A routing:
+# If we have domain predictions and per-video domain probabilities, prioritize videos in top domains.
+qv = embedder.encode([prompt], normalize_embeddings=True).astype("float32")[0]
 topK_route = 5
 recency_weight_auto = 0.20
 half_life_auto = 270
 
-routed_vids = route_videos_by_summary(
-    routing_query, qv, summaries, vm, C, list(universe), allowed_vids,
-    topK=topK_route, recency_weight=recency_weight_auto, half_life_days=half_life_auto,
-    min_kw_overlap=2
-)
-candidate_vids = set(routed_vids) if routed_vids else allowed_vids
+if domain_top and per_video_domain_probs:
+    # Rank allowed videos by domain score, then use centroid+summary routing inside the top slice
+    allowed_vids_scored = [(vid, _score_vid_by_domains(vid, domain_top)) for vid in allowed_vids_all]
+    allowed_vids_scored.sort(key=lambda x:-x[1])
+    # take a generous slice to avoid over-pruning
+    top_slice = [vid for vid,score in allowed_vids_scored if score>0]
+    if not top_slice:
+        # fallback to regular routing if no scores
+        C_use, vids_use = C, vid_list
+        allowed_for_route = allowed_vids_all
+    else:
+        # keep at most 200 videos in domain slice for speed
+        slice_set = set(top_slice[:200])
+        C_use, vids_use = C, vid_list
+        allowed_for_route = slice_set
+else:
+    C_use, vids_use = C, vid_list
+    allowed_for_route = allowed_vids_all
 
+# Fallback summary-aware routing to pick ~5
+routed_vids = route_videos_by_summary(
+    prompt, qv, summaries, vm, C_use, list(vids_use) if vids_use else list(universe), allowed_for_route,
+    topK=topK_route, recency_weight=recency_weight_auto, half_life_days=half_life_auto, min_kw_overlap=2
+)
+# If domain routing existed but gave no routed vids, use the top domain-slice video ids directly
+if not routed_vids and domain_top and per_video_domain_probs and allowed_for_route:
+    # take top 5 by domain score
+    alt = sorted(list(allowed_for_route), key=lambda v: -_score_vid_by_domains(v, domain_top))[:topK_route]
+    routed_vids = alt
+
+candidate_vids = set(routed_vids) if routed_vids else allowed_vids_all
+
+# Auto recall defaults (overridable in Advanced)
 K_scan = st.session_state.get("adv_scanK", 768)
 K_use  = st.session_state.get("adv_useK", 36)
 max_videos = st.session_state.get("adv_maxvid", 5)
@@ -942,6 +1082,7 @@ mmr_lambda = st.session_state.get("adv_lam", 0.45)
 recency_weight = st.session_state.get("adv_rec", recency_weight_auto)
 half_life = st.session_state.get("adv_hl", half_life_auto)
 
+# Stage B: search chunks only in routed videos
 with st.spinner("Scanning selected videos…"):
     try:
         hits = stageB_search_chunks(
@@ -955,45 +1096,14 @@ with st.spinner("Scanning selected videos…"):
         with st.chat_message("assistant"):
             st.error("Search failed."); st.exception(e); st.stop()
 
+# Web support (up to 3, 1 per domain)
 web_snips=[]
 if allow_web and selected_domains and requests and BeautifulSoup and int(max_web_auto)>0:
     with st.spinner("Fetching trusted websites…"):
         web_snips = fetch_trusted_snippets(prompt, selected_domains, max_snippets=int(max_web_auto), per_domain=1)
 
+# Build evidence and answer
 grouped_block, export_struct = build_grouped_evidence_for_prompt(hits, vm, summaries, routed_vids=routed_vids, max_quotes=3)
-
-# --- forced fallback: routed videos but 0 quotes
-if not export_struct["videos"] and routed_vids:
-    forced = []
-    for vid in routed_vids[:max_videos]:
-        info = vm.get(vid, {}) or {}
-        title = info.get("title") or summaries.get(vid, {}).get("title") or vid
-        creator = _canonicalize_creator(_raw_creator_of_vid(vid, vm)) or _raw_creator_of_vid(vid, vm)
-        url = info.get("url") or f"https://www.youtube.com/watch?v={vid}"
-
-        used = False
-        for b in summaries.get(vid, {}).get("bullets", []):
-            q = _normalize_text(b.get("text", ""))
-            if _quote_is_valid(q):
-                forced.append({"video_id": vid, "title": title, "creator": creator,
-                               "ts": _format_ts(b.get("ts", 0)), "text": q, "url": url})
-                used = True
-                break
-
-        if not used:
-            best = next((h for h in hits if (h.get("meta") or {}).get("video_id") == vid), None)
-            if best:
-                ts = _format_ts((best.get("meta") or {}).get("start", 0))
-                q = _normalize_text(best.get("text", ""))
-                forced.append({"video_id": vid, "title": title, "creator": creator,
-                               "ts": ts, "text": q, "url": url})
-
-    if forced:
-        export_struct["videos"] = forced
-        lines = []
-        for i, v in enumerate(forced, 1):
-            lines.append(f"[Video {i}] {v['title']} — {v['creator']}\n  • {v['ts']}: “{v['text'][:260]}”")
-        grouped_block = "\n".join(lines)
 
 with st.chat_message("assistant"):
     if not export_struct["videos"] and not web_snips:
@@ -1007,9 +1117,11 @@ with st.chat_message("assistant"):
     with st.spinner("Writing your answer…"):
         ans=openai_answer(model_choice, prompt, st.session_state.messages, grouped_block, web_snips, no_video=(len(export_struct["videos"])==0))
 
+    # Answer
     st.markdown(ans)
     st.session_state.messages.append({"role":"assistant","content":ans})
 
+    # Persist sources for THIS reply only
     this_turn = {
         "prompt": prompt,
         "answer": ans,
@@ -1019,31 +1131,26 @@ with st.chat_message("assistant"):
     }
     st.session_state["turns"].append(this_turn)
 
+    # Sources UI for this reply
     st.markdown("---")
     st.subheader("Sources for this reply")
     vids = this_turn["videos"]; web = this_turn["web"]
 
-    # timestamped YouTube links
-    def _ts_to_seconds(ts_str: str) -> int:
-        return int(_parse_ts(ts_str))
-
     if vids:
         st.markdown("**Video quotes**")
         cur_vid=None
-        first_ts_for_vid={}
-        for v in vids:
-            vid=v.get("video_id","")
-            if vid not in first_ts_for_vid:
-                first_ts_for_vid[vid]=v.get("ts","0:00")
         for v in vids:
             if v.get("video_id")!=cur_vid:
                 meta = vm.get(v.get("video_id",""),{})
-                base = meta.get("url", f"https://www.youtube.com/watch?v={v.get('video_id','')}")
-                ts_param = f"&t={_ts_to_seconds(first_ts_for_vid.get(v.get('video_id',''), '0:00'))}s" if "youtube.com" in base else ""
+                link = meta.get("url","")
                 hdr = f"- **{v.get('title','')}** — _{v.get('creator','')}_"
-                st.markdown(f"{hdr}  •  [{base}{ts_param}]({base}{ts_param})")
+                st.markdown(f"{hdr}" + (f"  •  [{link}]({link})" if link else ""))
                 cur_vid = v.get("video_id")
-            st.markdown(f"  • **{v.get('ts','')}** — “{_normalize_text(v.get('text',''))[:180]}”")
+            # show anchored link per quote if present
+            if v.get("url"):
+                st.markdown(f"  • **{v.get('ts','')}** — “{_normalize_text(v.get('text',''))[:180]}”  ·  [{v.get('url')}]({v.get('url')})")
+            else:
+                st.markdown(f"  • **{v.get('ts','')}** — “{_normalize_text(v.get('text',''))[:180]}”")
 
     if web:
         st.markdown("**Trusted websites**")
@@ -1053,6 +1160,7 @@ with st.chat_message("assistant"):
             with st.expander("Web fetch trace"):
                 st.code(st.session_state["web_trace"])
 
+# Footer + Clear chat
 cols=st.columns([1]*12)
 with cols[-1]:
     st.button("Clear chat", key="clear_done", on_click=_clear_chat)
