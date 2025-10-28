@@ -1,23 +1,15 @@
-#!/usr/bin/env python3
-"""
-Build a simple tag→video index from chunks.jsonl for sanity checks.
-Usage:
-  python scripts/build_tag_index.py --chunks data/chunks/chunks.jsonl \
-    --out data/domain/tag_index.json --terms apob ldl statin sleep magnesium
-"""
 import argparse, json, re
 from pathlib import Path
 from collections import defaultdict
 
-def norm(s): return re.sub(r"\s+"," ", (s or "").strip())
+def norm(s): return re.sub(r"\s+"," ",(s or "")).strip()
 
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--chunks", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--terms", nargs="+", required=True)
+    ap.add_argument("--terms", nargs="+", default=["apob","ldl","statin","sleep","magnesium","melatonin","pcsk9"])
     args=ap.parse_args()
-
     pat=re.compile(r"("+"|".join(map(re.escape,args.terms))+r")", re.I)
     idx=defaultdict(set)
     with open(args.chunks, encoding="utf-8") as f:
@@ -36,6 +28,5 @@ def main():
     out={k: sorted(list(v)) for k,v in idx.items()}
     Path(args.out).write_text(json.dumps(out, indent=2), encoding="utf-8")
     print(f"Saved {args.out}")
-
 if __name__=="__main__":
     main()
