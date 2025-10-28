@@ -57,7 +57,7 @@ except Exception:
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
 
-DATA_ROOT = Path(os.getenv("DATA_DIR","/var/data")).resolve()
+DATA_ROOT = Path(os.getenv("DATA_DIR","/var/data/data")).resolve()
 
 # Core RAG artifacts
 CHUNKS_PATH     = DATA_ROOT / "data/chunks/chunks.jsonl"
