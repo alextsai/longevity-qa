@@ -1,10 +1,9 @@
-import argparse, json, csv, re, yaml, joblib
+import argparse, json, csv, re, joblib, yaml
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import classification_report
 
@@ -17,7 +16,8 @@ def load_labels(p):
         for row in csv.DictReader(f):
             vid=row.get("video_id") or row.get("id")
             lab=row.get("label")
-            if vid and lab: ymap[vid]=lab.strip().lower()
+            if vid and lab and lab.strip():
+                ymap[vid]=lab.strip().lower()
     return ymap
 
 def load_meta(p):
@@ -25,10 +25,10 @@ def load_meta(p):
     return json.loads(Path(p).read_text(encoding="utf-8"))
 
 def load_texts(chunks_path, video_meta):
-    # Build per-video concatenated text from chunks; fall back to title+desc
     by_vid = defaultdict(list)
-    if Path(chunks_path).exists():
-        with open(chunks_path, encoding="utf-8") as f:
+    cp = Path(chunks_path)
+    if cp.exists():
+        with cp.open(encoding="utf-8") as f:
             for ln in f:
                 try:j=json.loads(ln)
                 except:continue
@@ -71,30 +71,38 @@ def main():
     if not X_text:
         raise SystemExit("No training data matched your labels.")
 
-    # Pipeline: TF-IDF -> Standardize length features -> LogisticRegression
-    vec=TfidfVectorizer(ngram_range=(1,2), min_df=2, max_df=0.9, max_features=120000)
-    clf=LogisticRegression(max_iter=2000, n_jobs=1, class_weight="balanced")
+    # small-N safe TF-IDF settings
+    docN = len(X_text)
+    min_df = 1 if docN < 50 else 2
+    max_df = 1.0 if docN < 50 else 0.9
+
+    vec=TfidfVectorizer(ngram_range=(1,2), min_df=min_df, max_df=max_df, max_features=120000)
+    clf=LogisticRegression(max_iter=2000, class_weight="balanced")
     pipe=Pipeline([("tfidf", vec), ("clf", clf)])
     pipe.fit(X_text, y)
 
     # Save model
     joblib.dump(pipe, out/"domain_model.joblib")
 
-    # Predict calibrated probabilities for labeled vids as a sanity export
+    # Save calibrated probs with pure-Python types
     proba = pipe.predict_proba(X_text)
-    classes=list(pipe.classes_)
-    rows=[]
+    classes = [str(c) for c in list(pipe.classes_)]
+    rows = []
     for vid, probs in zip(vids, proba):
-        rows.append({"video_id": vid, **{c: float(p) for c,p in zip(classes, probs)}})
-    Path(out/"domain_probs.yaml").write_text(yaml.safe_dump(rows, allow_unicode=True), encoding="utf-8")
+        row = {"video_id": str(vid)}
+        for c, p in zip(classes, probs.tolist()):
+            row[c] = float(p)
+        rows.append(row)
 
-    # Save a trivial scaler for API symmetry (not used because TF-IDF is already normalized)
-    joblib.dump(StandardScaler(with_mean=False, with_std=False), out/"scaler.joblib")
+    (out/"domain_probs.json").write_text(
+        json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (out/"domain_probs.yaml").write_text(
+        yaml.safe_dump(rows, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
 
-    # Report
-    yhat=pipe.predict(X_text)
-    print(classification_report(y, yhat))
-    print(f"Saved: {out/'domain_model.joblib'}, {out/'scaler.joblib'}, {out/'domain_probs.yaml'}")
+    print(classification_report(y, pipe.predict(X_text)))
+    print(f"Saved: {out/'domain_model.joblib'}, {out/'domain_probs.json'}, {out/'domain_probs.yaml'}")
 
 if __name__=="__main__":
     main()
