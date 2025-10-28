@@ -77,6 +77,22 @@ DOMAIN_PROBS_YAML = DATA_ROOT / "data/domain/domain_probs.yaml"
 REQUIRED = [INDEX_PATH, METAS_PKL, CHUNKS_PATH, VIDEO_META_JSON]
 WEB_FALLBACK = os.getenv("WEB_FALLBACK","true").strip().lower() in {"1","true","yes","on"}
 
+# --- bootstrap domain artifacts into the mounted volume if missing ---
+from shutil import copy2
+def _ensure_domain_artifacts():
+    repo_root = Path(__file__).resolve().parents[1]  # /workspace
+    src_dir = repo_root / "data" / "domain"
+    dst_dir = DATA_ROOT / "data" / "domain"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for fn in ["domain_model.joblib", "domain_probs.json", "domain_probs.yaml"]:
+        s = src_dir / fn
+        d = dst_dir / fn
+        if s.exists() and not d.exists():
+            try: copy2(s, d)
+            except Exception: pass
+_ensure_domain_artifacts()
+
+
 # ---------- Trusted domains ----------
 TRUSTED_DOMAINS = [
     "nih.gov","medlineplus.gov","cdc.gov","mayoclinic.org","health.harvard.edu",
