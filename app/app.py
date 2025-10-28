@@ -52,6 +52,42 @@ try:
 except Exception:
     joblib=None
 
+import hashlib, joblib
+
+def _sha256(p: Path) -> str:
+    try:
+        h = hashlib.sha256()
+        with p.open('rb') as f:
+            for chunk in iter(lambda: f.read(1<<20), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+def verify_domain_artifacts():
+    repo = Path(__file__).resolve().parents[1] / "data" / "domain"          # /workspace/data/domain
+    vol  = DATA_ROOT / "data" / "domain"                                    # /var/data/data/domain
+    files = ["domain_model.joblib", "domain_probs.json", "domain_probs.yaml"]
+    rows = []
+    for fn in files:
+        pr = repo / fn
+        pv = vol  / fn
+        rows.append({
+            "file": fn,
+            "repo_exists": pr.exists(), "repo_size": pr.stat().st_size if pr.exists() else 0, "repo_sha256": _sha256(pr) if pr.exists() else "",
+            "vol_exists":  pv.exists(), "vol_size":  pv.stat().st_size if pv.exists() else 0, "vol_sha256":  _sha256(pv) if pv.exists() else "",
+        })
+    # try loading the model if present
+    load_ok = None
+    classes = []
+    try:
+        model_path = (vol / "domain_model.joblib") if (vol / "domain_model.joblib").exists() else (repo / "domain_model.joblib")
+        pipe = joblib.load(model_path)
+        classes = list(getattr(pipe, "classes_", []))
+        load_ok = True
+    except Exception:
+        load_ok = False
+    return {"DATA_DIR": str(DATA_ROOT), "rows": rows, "model_load_ok": load_ok, "classes": classes}
 
 # ---------- Paths ----------
 ROOT = Path(__file__).resolve().parents[1]
@@ -835,7 +871,11 @@ def _path_exists_report()->Dict[str, Any]:
         "domain_probs_yaml": str(DOMAIN_PROBS_YAML), "domain_probs_yaml_exists": DOMAIN_PROBS_YAML.exists(),
     }
 
-
+if _is_admin():
+    # ... existing admin UI ...
+    if st.button("Verify domain artifacts"):
+        st.code(json.dumps(verify_domain_artifacts(), indent=2))
+       
 # ---------- Creator index ----------
 def build_creator_indexes_from_chunks(vm: dict) -> tuple[dict, dict]:
     """
