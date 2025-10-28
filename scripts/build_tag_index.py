@@ -1,42 +1,41 @@
-# scripts/build_tag_index.py
-import json, re, argparse
+#!/usr/bin/env python3
+"""
+Build a simple tag→video index from chunks.jsonl for sanity checks.
+Usage:
+  python scripts/build_tag_index.py --chunks data/chunks/chunks.jsonl \
+    --out data/domain/tag_index.json --terms apob ldl statin sleep magnesium
+"""
+import argparse, json, re
 from pathlib import Path
-from collections import Counter
+from collections import defaultdict
 
-KEYSETS = {
-  "cardio": {"ldl","apob","statin","ezetimibe","pcsk9","bempedoic","inclisiran","atherosclerosis","coronary","angiogram","calcium","plaque","triglyceride"},
-  "sleep": {"sleep","melatonin","magnesium","insomnia","apnea","circadian","valerian","glycine"},
-  "nutrition": {"protein","fasting","fiber","omega","olive","polyphenol","choline","glycemic","sugar","fructose","polyphenols"},
-  "immune": {"immune","infection","vitamin d","zinc","omega-3","inflammation","cytokine","antibody"},
-}
+def norm(s): return re.sub(r"\s+"," ", (s or "").strip())
 
-def toks(s): return re.findall(r"[a-z0-9]+", (s or "").lower())
-
-def main(a):
-    vs = json.loads(Path(a.video_summaries).read_text(encoding="utf-8"))
-    vm = json.loads(Path(a.video_meta).read_text(encoding="utf-8"))
-
-    out={}
-    for vid in set(list(vs.keys()) + list(vm.keys())):
-        tags=set()
-        title = (vm.get(vid,{}) or {}).get("title","")
-        bullets = " ".join([b.get("text","") for b in (vs.get(vid,{}).get("bullets",[]) or [])])
-        bag = set(toks(title) + toks(bullets))
-        # domain tags
-        for dom,keys in KEYSETS.items():
-            if len(bag & keys)>0: tags.add(dom)
-        # top keywords
-        cnt=Counter(toks(title+" "+bullets))
-        for w,_ in cnt.most_common(12):
-            if len(w)>=4: tags.add(w)
-        out[vid]=sorted(tags)
-
-    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(a.out).write_text(json.dumps(out, indent=2), encoding="utf-8")
-
-if __name__ == "__main__":
+def main():
     ap=argparse.ArgumentParser()
-    ap.add_argument("--video_summaries", required=True, help="/var/data/data/catalog/video_summaries.json")
-    ap.add_argument("--video_meta", required=True, help="/var/data/data/catalog/video_meta.json")
-    ap.add_argument("--out", required=True, help="/var/data/data/catalog/tag_index.json")
-    main(ap.parse_args())
+    ap.add_argument("--chunks", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--terms", nargs="+", required=True)
+    args=ap.parse_args()
+
+    pat=re.compile(r"("+"|".join(map(re.escape,args.terms))+r")", re.I)
+    idx=defaultdict(set)
+    with open(args.chunks, encoding="utf-8") as f:
+        for ln in f:
+            try:j=json.loads(ln)
+            except:continue
+            m=j.get("meta") or {}
+            vid=(m.get("video_id") or m.get("vid") or m.get("ytid") or
+                 j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id"))
+            t=norm(j.get("text",""))
+            if not vid or not t: continue
+            if pat.search(t):
+                for term in args.terms:
+                    if re.search(rf"\b{re.escape(term)}\b", t, re.I):
+                        idx[term].add(vid)
+    out={k: sorted(list(v)) for k,v in idx.items()}
+    Path(args.out).write_text(json.dumps(out, indent=2), encoding="utf-8")
+    print(f"Saved {args.out}")
+
+if __name__=="__main__":
+    main()
