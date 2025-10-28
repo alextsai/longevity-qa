@@ -1,82 +1,93 @@
-# scripts/train_domain_classifier.py
-# Train a simple SVM domain classifier on question text; persists model + thresholds.
+#!/usr/bin/env python3
+"""
+Train a simple TF-IDF + LogisticRegression domain classifier from labels.csv.
+Produces:
+- data/domain/domain_model.joblib
+- data/domain/scaler.joblib  (dummy for API symmetry)
+- data/domain/domain_probs.yaml (per-video class probabilities for inspection)
 
-import json, re, yaml, argparse
+labels.csv columns: video_id,label
+label ∈ {cardio, sleep, nutrition, supplements, metabolic, …}
+"""
+import argparse, json, re, yaml, joblib
 from pathlib import Path
+from collections import defaultdict
+from typing import List, Dict
 import numpy as np
-from sklearn.svm import SVC
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
-import joblib
-from sentence_transformers import SentenceTransformer
 
-DOMAINS = ["cardio","sleep","nutrition","immune"]
+from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report
 
 def norm(s:str)->str:
-    return re.sub(r"\s+"," ", (s or "").strip().lower())
+    return re.sub(r"\s+"," ", (s or "").strip())
 
-def load_dataset(p:Path):
+def load_texts(chunks_path:Path, video_meta:Dict[str,Dict], vids:List[str])->Dict[str,str]:
     """
-    Expects JSONL with fields: {"text": "...", "label": "cardio|sleep|nutrition|immune"}
-    Minimal starter: you can bootstrap from your own Q history.
+    Aggregate transcript text per video. If chunks.jsonl missing, fall back to titles.
     """
-    X,Y=[],[]
-    for ln in p.read_text(encoding="utf-8").splitlines():
-        if not ln.strip(): continue
-        j=json.loads(ln)
-        t=norm(j.get("text","")); y=norm(j.get("label",""))
-        if t and y in DOMAINS:
-            X.append(t); Y.append(y)
-    return X,Y
+    out={v:"" for v in vids}
+    if chunks_path.exists():
+        with chunks_path.open(encoding="utf-8") as f:
+            for ln in f:
+                try:j=json.loads(ln)
+                except: continue
+                m=j.get("meta") or {}
+                vid=m.get("video_id") or m.get("vid") or m.get("ytid") or j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id")
+                if vid in out:
+                    out[vid] += " " + norm(j.get("text",""))
+    # title fallback
+    for vid in vids:
+        if not out[vid]:
+            out[vid]=norm((video_meta.get(vid,{}) or {}).get("title",""))
+    return out
 
-def main(args):
-    data_p = Path(args.data)
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
+def main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--chunks", required=True)
+    ap.add_argument("--video-meta", required=True)
+    ap.add_argument("--labels", required=True)
+    ap.add_argument("--out-dir", required=True)
+    args=ap.parse_args()
 
-    Xtxt, Ylab = load_dataset(data_p)
-    if not Xtxt: raise SystemExit("no training data")
+    chunks=Path(args.chunks)
+    video_meta=Path(args.video_meta)
+    labels_path=Path(args.labels)
+    out=Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
 
-    enc = SentenceTransformer("intfloat/e5-large-v2")
-    Xemb = enc.encode(Xtxt, normalize_embeddings=True, batch_size=64).astype("float32")
+    vm = json.loads(video_meta.read_text(encoding="utf-8"))
+    rows=[ln.strip().split(",") for ln in labels_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    header = rows[0]
+    if [h.strip().lower() for h in header] != ["video_id","label"]:
+        rows = [["video_id","label"]] + rows  # best-effort tolerate missing header
+    data = rows[1:]
 
-    y_map = {d:i for i,d in enumerate(DOMAINS)}
-    y = np.array([y_map[l] for l in Ylab], dtype=np.int64)
+    vids=[r[0] for r in data]; y=[r[1] for r in data]
+    texts = load_texts(chunks, vm, vids)
+    X=[texts[v] for v in vids]
 
-    Xtr, Xte, ytr, yte = train_test_split(Xemb, y, test_size=0.2, random_state=42, stratify=y)
+    pipe = Pipeline([
+        ("tfidf", TfidfVectorizer(max_features=200000, ngram_range=(1,2), min_df=2)),
+        ("clf", LogisticRegression(max_iter=200, n_jobs=-1, class_weight="balanced"))
+    ])
+    pipe.fit(X, y)
 
-    scaler = StandardScaler(with_mean=True, with_std=True)
-    Xtr_s = scaler.fit_transform(Xtr); Xte_s = scaler.transform(Xte)
+    joblib.dump(pipe, out/"domain_model.joblib")
+    joblib.dump(StandardScaler(with_mean=False, with_std=False), out/"scaler.joblib")
 
-    clf = SVC(C=4.0, kernel="rbf", probability=True, class_weight="balanced", random_state=42)
-    clf.fit(Xtr_s, ytr)
+    # export per-video probs for audit
+    proba = pipe.predict_proba(X)
+    classes=list(pipe.classes_)
+    out_rows=[]
+    for vid, probs in zip(vids, proba):
+        out_rows.append({"video_id": vid, **{c: float(p) for c,p in zip(classes, probs)}})
+    (out/"domain_probs.yaml").write_text(yaml.safe_dump(out_rows, allow_unicode=True), encoding="utf-8")
 
-    ypro = clf.predict_proba(Xte_s)
-    yhat = ypro.argmax(1)
-    rep = classification_report(yte, yhat, target_names=DOMAINS, digits=3)
-    print(rep)
+    yhat=pipe.predict(X)
+    print(classification_report(y, yhat))
+    print(f"Saved: {out/'domain_model.joblib'}, {out/'scaler.joblib'}, {out/'domain_probs.yaml'}")
 
-    # Per-class OOD threshold = 25th percentile of max-prob when predicted correctly
-    maxp = ypro.max(1)
-    correct = (yhat==yte)
-    thr = {}
-    for i,d in enumerate(DOMAINS):
-        vals = maxp[(yhat==i)&correct]
-        thr[d] = float(np.percentile(vals, 25)) if len(vals)>5 else 0.40
-
-    # Persist
-    joblib.dump(clf, out_dir/"domain_model.joblib")
-    joblib.dump(scaler, out_dir/"scaler.joblib")
-    (out_dir/"label_map.json").write_text(json.dumps({str(i):d for i,d in enumerate(DOMAINS)}, indent=2))
-    (out_dir/"ood_threshold.json").write_text(json.dumps(thr, indent=2))
-
-    # Domain priors for transparency
-    pri = {d: float((y==i).mean()) for i,d in enumerate(DOMAINS)}
-    (out_dir/"domain_probs.yaml").write_text(yaml.safe_dump({"priors":pri, "eval_report":rep}, sort_keys=False))
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True, help="path to domain_labeled.jsonl")
-    ap.add_argument("--out",  required=True, help="output dir, e.g., /var/data/data/models/domain")
-    main(ap.parse_args())
+if __name__=="__main__":
+    main()
