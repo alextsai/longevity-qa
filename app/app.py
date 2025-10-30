@@ -2,21 +2,18 @@
 """
 Health | Nutrition Q&A — experts-first RAG + domain routing + trusted web (Phase 2)
 
-Adds:
-- Streaming tokens to UI.
-- Stage-A routes 8–12 videos and never blocks on missing summaries.
-- Stage-B recalls from ≥3 distinct videos when possible.
-- Quote relevance gate: keyword overlap + cosine similarity to query.
-- Trusted web always returns ≥2 snippets for supplemental evidence.
-- Domain artifacts auto-bootstrap from repo to mounted volume if missing.
-- Turn snapshots to disk to mitigate network drops.
-- Admin metrics: path checks, precompute, centroids repair, creator inventory, session snapshot time, approx unique sessions.
+Key fixes in this build
+- Precision routing: domain-aligned slice + summary/centroid routing with keyword overlap.
+- Quote quality: keyword overlap + cosine gate; guarantee ≥2 quotes per routed video via bullets fallback.
+- Source accuracy: show timestamped YouTube links and titled trusted web links; per-turn immutable sources.
+- Web reliability: dual DuckDuckGo modes, title extraction, homepage fallback, and trace logging.
+- Robustness: automatic centroid renormalization, offsets persistence, turn snapshots, admin rebuilds.
+- Embedder upgrade guard: respects EMBEDDER_MODEL env (e.g., bge-base-en-v1.5, e5-base-v2), but stays compatible with existing FAISS.
 
-Infra:
-- DATA_DIR must point at repo root that contains data/{chunks,index,catalog,domain}.
-- OPENAI_API_KEY must be set in the environment.
-- Optional domain artifacts: data/domain/domain_model.joblib, data/domain/domain_probs.(json|yaml)
-
+Infra assumptions
+- DATA_DIR points to a directory containing data/{chunks,index,catalog,domain}.
+- OPENAI_API_KEY is set in the environment.
+- Optional domain artifacts: data/domain/{domain_model.joblib, domain_probs.(json|yaml)}.
 """
 
 from __future__ import annotations
@@ -55,9 +52,9 @@ except Exception:
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
 
-# Mounted data root (Railway mounts under /var/data). Keep nested /data/* layout inside.
+# Mounted data root; all artifacts under /var/data/data/*
 DATA_ROOT = Path(os.getenv("DATA_DIR","/var/data")).resolve()
-DATA_DIR = DATA_ROOT / "data"  # all artifacts expected under /var/data/data/*
+DATA_DIR = DATA_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # Core RAG artifacts
@@ -70,7 +67,7 @@ VID_CENT_NPY    = DATA_DIR / "index/video_centroids.npy"
 VID_IDS_TXT     = DATA_DIR / "index/video_ids.txt"
 VID_SUM_JSON    = DATA_DIR / "catalog/video_summaries.json"
 
-# Domain routing artifacts (optional but used if present)
+# Domain routing artifacts (optional)
 DOMAIN_DIR        = DATA_DIR / "domain"
 DOMAIN_MODEL      = DOMAIN_DIR / "domain_model.joblib"
 DOMAIN_PROBS_JSON = DOMAIN_DIR / "domain_probs.json"
@@ -189,7 +186,6 @@ def verify_domain_artifacts():
             "repo_exists": pr.exists(), "repo_size": pr.stat().st_size if pr.exists() else 0, "repo_sha256": _sha256(pr) if pr.exists() else "",
             "vol_exists":  pv.exists(), "vol_size":  pv.stat().st_size if pv.exists() else 0, "vol_sha256":  _sha256(pv) if pv.exists() else "",
         })
-    # try loading the model if present
     load_ok = None
     classes = []
     if joblib and (DOMAIN_MODEL.exists() or (repo/"domain_model.joblib").exists()):
@@ -235,10 +231,10 @@ def _canonicalize_creator(name: str) -> str | None:
             return canon
     return None
 
-# ---------- LLM answerers ----------
+# ---------- LLM answer streaming ----------
 def stream_openai_answer(model_name: str, question: str, history, grouped_video_block: str,
                          web_snips: list[dict], no_video: bool):
-    """Stream tokens to the UI."""
+    """Stream tokens to the UI. All claims must cite provided evidence."""
     if not os.getenv("OPENAI_API_KEY"):
         yield "⚠️ OPENAI_API_KEY is not set."
         return
@@ -335,30 +331,61 @@ def iter_jsonl_rows(indices:List[int], limit:int|None=None):
 # ---------- Model + FAISS ----------
 @st.cache_resource(show_spinner=False)
 def _load_embedder(model_name:str)->SentenceTransformer:
+    # Accept any sentence-transformers compatible model path or hub id
     return SentenceTransformer(model_name, device="cpu")
 
 @st.cache_resource(show_spinner=False)
 def load_metas_and_model(index_path:Path=INDEX_PATH, metas_path:Path=METAS_PKL):
+    """
+    Load FAISS and the embedder. Stay compatible with the existing index unless EMBEDDER_MODEL overrides.
+    - If EMBEDDER_MODEL is set, we try to load it. If its dim != index.d, we fallback to the model in metas.pkl.
+    - To fully upgrade to bge-base-en-v1.5 or e5-base-v2, rebuild FAISS with that model and set metas.pkl['model'] accordingly.
+    """
     if not index_path.exists() or not metas_path.exists(): return None, None, None
     index = faiss.read_index(str(index_path))
     with metas_path.open("rb") as f:
         payload=pickle.load(f)
-    model_name = payload.get("model","sentence-transformers/all-MiniLM-L6-v2")
+    idx_dim = index.d
+
+    env_override = os.getenv("EMBEDDER_MODEL", "").strip()
+    model_from_meta = payload.get("model","sentence-transformers/all-MiniLM-L6-v2")
+
+    def _try_model(name:str):
+        try:
+            emb = _load_embedder(name)
+            return emb, emb.get_sentence_embedding_dimension()
+        except Exception:
+            return None, None
+
+    # prefer override if dimension matches, else fallback to meta
+    if env_override:
+        emb, dim = _try_model(env_override)
+        if emb and dim == idx_dim:
+            return index, payload.get("metas",[]), {"model_name":env_override, "embedder":emb}
+
+    # try meta model
+    emb, dim = _try_model(model_from_meta)
+    if emb and dim == idx_dim:
+        return index, payload.get("metas",[]), {"model_name":model_from_meta, "embedder":emb}
+
+    # last resort: local MiniLM if stored under data/models
     local_dir = DATA_DIR/"models"/"all-MiniLM-L6-v2"
-    try_name = str(local_dir) if (local_dir/"config.json").exists() else model_name
-    embedder = _load_embedder(try_name)
-    if index.d != embedder.get_sentence_embedding_dimension():
-        raise RuntimeError(f"Embedding dim mismatch: FAISS={index.d} vs Encoder={embedder.get_sentence_embedding_dimension()}. Rebuild.")
-    return index, payload.get("metas",[]), {"model_name":try_name, "embedder":embedder}
+    try_name = str(local_dir) if (local_dir/"config.json").exists() else model_from_meta
+    emb, dim = _try_model(try_name)
+    if not emb or dim != idx_dim:
+        raise RuntimeError(f"Embedding dim mismatch. FAISS={idx_dim}. Override EMBEDDER_MODEL='{env_override}' or rebuild index.")
+    return index, payload.get("metas",[]), {"model_name":try_name, "embedder":emb}
 
 @st.cache_resource(show_spinner=False)
 def load_video_centroids():
     if not (VID_CENT_NPY.exists() and VID_IDS_TXT.exists()): return None, None
     C = np.load(VID_CENT_NPY).astype("float32")
+    # automatic renormalization to unit length
+    if C.ndim==2 and C.size>0:
+        n = np.linalg.norm(C,axis=1,keepdims=True) + 1e-12
+        C = C / n
     vids = VID_IDS_TXT.read_text(encoding="utf-8").splitlines()
     if C.ndim!=2 or C.shape[0]!=len(vids): return None, None
-    n = np.linalg.norm(C,axis=1,keepdims=True)+1e-12
-    C = C / n
     return C, vids
 
 @st.cache_data(show_spinner=False)
@@ -435,6 +462,11 @@ def mmr(qv:np.ndarray, doc_vecs:np.ndarray, k:int, lambda_diversity:float=0.45)-
         sel.append(pick); cand.remove(pick)
     return sel
 
+def _kw_overlap(a:str, b:str)->int:
+    A=set(re.findall(r"[a-z0-9]+", (a or "").lower()))
+    B=set(re.findall(r"[a-z0-9]+", (b or "").lower()))
+    return len(A & B)
+
 def _quote_is_valid(text:str)->bool:
     t=_normalize_text(text)
     if len(t) < 40: return False
@@ -450,11 +482,6 @@ def _dedupe_passages(items:List[Dict[str,Any]], time_window_sec:float=8.0, min_c
             continue
         seen.append(h); out.append(h)
     return out
-
-def _kw_overlap(a:str, b:str)->int:
-    A=set(re.findall(r"[a-z0-9]+", (a or "").lower()))
-    B=set(re.findall(r"[a-z0-9]+", (b or "").lower()))
-    return len(A & B)
 
 def _quote_relevance_ok(query:str, quote:str, qv:np.ndarray, embedder:SentenceTransformer,
                         min_overlap:int=3, min_cos:float=0.35)->bool:
@@ -508,7 +535,6 @@ def route_videos_by_summary(
         bullets = (summaries or {}).get(v, {}).get("bullets", [])
         pseudo = " ".join(b.get("text","") for b in bullets)[:3000]
         kw, overlap = _kw_score(pseudo, query, idf) if pseudo else (0.0, 0)
-        # tolerate sparse bullets; only skip if pseudo exists and overlap is zero
         if pseudo and overlap < min_kw_overlap:
             continue
         cs = cent.get(v, 0.0)
@@ -598,77 +624,96 @@ def _first_bullets(vid:str, summaries:dict, k:int=2)->List[dict]:
     return out
 
 def build_grouped_evidence_for_prompt(
-    hits:List[Dict[str,Any]], vm:dict, summaries:dict,
-    routed_vids:List[str], max_quotes:int=3, qv:np.ndarray|None=None, embedder:SentenceTransformer|None=None
-)->Tuple[str,Dict[str,Any]]:
-    groups=group_hits_by_video(hits)
-
-    # order: routed_vids first, then any extra with hits
-    order_vids = []
-    seen=set()
+    hits: List[Dict[str,Any]], vm:dict, summaries:dict,
+    routed_vids: List[str], max_quotes:int=3,
+    qv: np.ndarray | None = None, embedder: SentenceTransformer | None = None
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Build grouped, timestamped evidence for the LLM and UI.
+    - Keep routed order.
+    - Strict quote gate: keyword overlap and cosine to query.
+    - Guarantee ≥2 quotes per routed video via summary bullets fallback.
+    - Always include a playable YouTube timestamp link when url is known.
+    """
+    groups = group_hits_by_video(hits)
+    order_vids, seen = [], set()
     for v in routed_vids:
         if v not in seen: order_vids.append(v); seen.add(v)
     for v in groups.keys():
         if v not in seen: order_vids.append(v); seen.add(v)
 
-    lines=[]; export=[]
+    lines, export = [], []
+    query_txt = st.session_state.get("_last_query", "")
+
     for v_idx, vid in enumerate(order_vids, 1):
-        info=vm.get(vid,{})
-        if not info and vid not in groups:
+        info=vm.get(vid,{}) or {}
+        if (vid not in groups) and not (summaries or {}).get(vid):
             continue
         title=info.get("title") or (summaries or {}).get(vid,{}).get("title") or vid
         creator_raw=_raw_creator_of_vid(vid, vm)
         creator=_canonicalize_creator(creator_raw) or creator_raw
-        date=info.get("published_at") or info.get("publishedAt") or info.get("date") or (summaries or {}).get(vid,{}).get("published_at") or ""
-        url=info.get("url") or ""
-        lines.append(f"[Video {v_idx}] {title} — {creator}" + (f" — {date}" if date else "") + (f" — {url}" if url else ""))
+        date=info.get("published_at") or info.get("publishedAt") or info.get("date") \
+             or (summaries or {}).get(vid,{}).get("published_at") or ""
+        base_url = info.get("url") or f"https://www.youtube.com/watch?v={vid}"
+
+        lines.append(f"[Video {v_idx}] {title} — {creator}" 
+                     + (f" — {date}" if date else "")
+                     + (f" — {base_url}" if base_url else ""))
 
         items = groups.get(vid, [])
         clean=_dedupe_passages(items, time_window_sec=8.0, min_chars=40)
 
-        # relevance filter against the query vector
+        kept=[]
         if qv is not None and embedder is not None:
-            clean = [h for h in clean if _quote_relevance_ok(
-                st.session_state.get("_last_query",""),
-                _normalize_text(h.get("text","")),
-                qv, embedder
-            )]
+            for h in clean:
+                q = _normalize_text(h.get("text",""))
+                if _quote_relevance_ok(query_txt, q, qv, embedder, min_overlap=3, min_cos=0.35):
+                    kept.append(h)
+        else:
+            kept = clean
 
         used=0
-        for h in clean[:max_quotes]:
-            t0 = float((h.get("meta") or {}).get("start",0))
+        for h in kept[:max_quotes]:
+            t0=float((h.get("meta") or {}).get("start",0))
             ts=_format_ts(t0)
             q=_normalize_text(h.get("text",""))
             lines.append(f"  • {ts}: “{q[:260]}”")
-            export.append({"video_id":vid,"title":title,"creator":creator,"ts":ts,"text":q,"url": _yt_ts_url(url, t0) if url else url})
+            export.append({"video_id":vid,"title":title,"creator":creator,"ts":ts,"text":q,"url": _yt_ts_url(base_url, t0)})
             used+=1
 
-        if used==0:
-            for b in _first_bullets(vid, summaries or {}, k=min(2,max_quotes)):
+        # fallback 1: summary bullets to guarantee at least two quotes
+        need = max(0, max(2, min(2, max_quotes)) - used)
+        if need > 0:
+            for b in _first_bullets(vid, summaries or {}, k=need+1):
                 ts_txt = b["ts"]
-                try_sec = sum(float(x)*60**i for i,x in enumerate(reversed(ts_txt.split(":")))) if ts_txt else 0.0
+                try_sec = 0.0
+                if ts_txt:
+                    parts = [float(x) for x in ts_txt.split(":")]
+                    try_sec = sum(p * (60 ** i) for i, p in enumerate(reversed(parts)))
                 lines.append(f"  • {ts_txt}: “{b['text'][:260]}”")
-                export.append({"video_id":vid,"title":title,"creator":creator,"ts":ts_txt,"text":b["text"],"url": _yt_ts_url(url, try_sec) if url else url})
+                export.append({"video_id":vid,"title":title,"creator":creator,"ts":ts_txt,"text":b["text"],"url": _yt_ts_url(base_url, try_sec)})
                 used+=1
                 if used>=max_quotes: break
 
+        # fallback 2: top raw chunk if still empty
         if used==0 and items:
             h=items[0]
             t0=float((h.get("meta") or {}).get("start",0))
             ts=_format_ts(t0)
             q=_normalize_text(h.get("text",""))
             lines.append(f"  • {ts}: “{q[:260]}”")
-            export.append({"video_id":vid,"title":title,"creator":creator,"ts":ts,"text":q,"url": _yt_ts_url(url, t0) if url else url})
+            export.append({"video_id":vid,"title":title,"creator":creator,"ts":ts,"text":q,"url": _yt_ts_url(base_url, t0)})
 
         lines.append("")
+
     return "\n".join(lines).strip(), {"videos": export}
 
-# ---------- Web fetch ----------
+# ---------- Web fetch with titles ----------
 def _ddg_html(domain:str, query:str, headers:dict, timeout:float)->List[str]:
     try:
         r=requests.get("https://duckduckgo.com/html/", params={"q":f"site:{domain} {query}"}, headers=headers, timeout=timeout)
         if r.status_code!=200: return []
-        soup=BeautifulSoup(r.text,"html.parser")
+        soup=BeautifulSoup(r.text,"htmlparser") if False else BeautifulSoup(r.text,"html.parser")
         return [a.get("href") for a in soup.select("a.result__a") if a.get("href")]
     except Exception:
         return []
@@ -682,16 +727,20 @@ def _ddg_lite(domain:str, query:str, headers:dict, timeout:float)->List[str]:
     except Exception:
         return []
 
-def fetch_trusted_snippets(query:str, allowed_domains:List[str], max_snippets:int=3, per_domain:int=1, timeout:float=6.0):
-    trace=[]
-    out=[]
-    if not requests or not BeautifulSoup or max_snippets<=0:
+def fetch_trusted_snippets(query: str, allowed_domains: List[str],
+                           max_snippets: int = 3, per_domain: int = 1, timeout: float = 6.0):
+    """
+    Return [{domain, url, title, text}], at least 1 per domain, up to max_snippets. Logs trace.
+    """
+    trace, out = [], []
+    if not requests or not BeautifulSoup or max_snippets <= 0:
         st.session_state["web_trace"] = "requests/bs4 unavailable."
         return []
 
-    headers={"User-Agent":"Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0"}
+
     for domain in allowed_domains:
-        links=_ddg_html(domain, query, headers, timeout)
+        links = _ddg_html(domain, query, headers, timeout)
         if not links:
             links=_ddg_lite(domain, query, headers, timeout)
             trace.append(f"{domain}: lite links={len(links)}")
@@ -702,25 +751,25 @@ def fetch_trusted_snippets(query:str, allowed_domains:List[str], max_snippets:in
             links=[f"https://{domain}"]
             trace.append(f"{domain}: homepage fallback")
 
-        links=links[:per_domain]
-        for url in links:
+        for url in links[:per_domain]:
             try:
-                r=requests.get(url, headers=headers, timeout=timeout)
-                if r.status_code!=200:
+                r = requests.get(url, headers=headers, timeout=timeout)
+                if r.status_code != 200:
                     trace.append(f"{domain}: {url} status {r.status_code}")
                     continue
-                soup=BeautifulSoup(r.text,"html.parser")
-                paras=[p.get_text(" ",strip=True) for p in soup.find_all("p")]
-                text=_normalize_text(" ".join(paras))[:1800]
-                if len(text)<200:
+                soup = BeautifulSoup(r.text, "htmlparser") if False else BeautifulSoup(r.text, "html.parser")
+                title = _normalize_text(soup.title.get_text(strip=True) if soup.title else "")
+                paras = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+                text = _normalize_text(" ".join(paras))[:1800]
+                if len(text) < 200:
                     trace.append(f"{domain}: {url} too short")
                     continue
-                out.append({"domain":domain,"url":url,"text":text})
+                out.append({"domain": domain, "url": url, "title": title, "text": text})
             except Exception as e:
                 trace.append(f"{domain}: fetch error {e}")
-        if len(out)>=max_snippets: break
+        if len(out) >= max_snippets: break
 
-    st.session_state["web_trace"]="; ".join(trace) if trace else "no trace"
+    st.session_state["web_trace"] = "; ".join(trace) if trace else "no trace"
     return out[:max_snippets]
 
 # ---------- Precompute + repairs (admin only) ----------
@@ -904,7 +953,7 @@ _record_session_hit()
 with st.sidebar:
     st.markdown("**Auto Mode** · accuracy and diversity enabled")
 
-    # Experts checklist with counts (expanded, directly under Auto Mode)
+    # Experts checklist
     vm = load_video_meta()
     vid_to_creator, creator_to_vids = build_creator_indexes_from_chunks(vm)
     counts={canon: len(creator_to_vids.get(canon,set())) for canon in ALLOWED_CREATORS}
@@ -939,23 +988,15 @@ with st.sidebar:
 
     # Advanced
     with st.expander("Advanced (technical controls)", expanded=False):
-        st.caption("Defaults are tuned. Adjust only if you know what you’re changing.")
-        st.number_input("Scan candidates first (K)", 128, 5000, 768, 64, key="adv_scanK",
-                        help="Number of top passages to pull from FAISS before re-ranking.")
-        st.number_input("Use top passages", 8, 200, 48, 2, key="adv_useK",
-                        help="Final number of passages to keep after diversification and caps.")
-        st.number_input("Max videos", 3, 20, 8, 1, key="adv_maxvid",
-                        help="Upper bound on distinct videos quoted in the final answer.")
-        st.number_input("Passages per video cap", 1, 10, 4, 1, key="adv_cap",
-                        help="Limit quotes per video to increase diversity.")
-        st.checkbox("Diversify with MMR", value=True, key="adv_mmr",
-                    help="Maximal Marginal Relevance balances relevance and diversity.")
-        st.slider("MMR balance", 0.1, 0.9, 0.45, 0.05, key="adv_lam",
-                  help="Lower favors relevance, higher favors diversity across quotes.")
-        st.slider("Recency weight", 0.0, 1.0, 0.20, 0.05, key="adv_rec",
-                  help="Blend of relevance with recency preference.")
-        st.slider("Recency half-life (days)", 7, 720, 270, 7, key="adv_hl",
-                  help="The time for recency score to halve. Larger prefers newer content less strongly.")
+        st.caption("Defaults are tuned.")
+        st.number_input("Scan candidates first (K)", 128, 5000, 768, 64, key="adv_scanK")
+        st.number_input("Use top passages", 8, 200, 48, 2, key="adv_useK")
+        st.number_input("Max videos", 3, 20, 8, 1, key="adv_maxvid")
+        st.number_input("Passages per video cap", 1, 10, 4, 1, key="adv_cap")
+        st.checkbox("Diversify with MMR", value=True, key="adv_mmr")
+        st.slider("MMR balance", 0.1, 0.9, 0.45, 0.05, key="adv_lam")
+        st.slider("Recency weight", 0.0, 1.0, 0.20, 0.05, key="adv_rec")
+        st.slider("Recency half-life (days)", 7, 720, 270, 7, key="adv_hl")
 
     st.divider()
     show_diag = st.toggle("Show data diagnostics", value=False)
@@ -1040,7 +1081,11 @@ if prompt is None:
                 if web:
                     with st.expander("Trusted websites", expanded=False):
                         for j, s in enumerate(web, 1):
-                            st.markdown(f"- W{j}: [{s['domain']}]({s['url']})")
+                            title = s.get("title") or s["domain"]
+                            st.markdown(f"- W{j}: [{title}]({s['url']}) · {s['domain']}")
+                        if st.session_state.get("web_trace"):
+                            with st.expander("Web fetch trace", expanded=False):
+                                st.code(st.session_state["web_trace"])
     cols=st.columns([1]*12)
     with cols[-1]:
         st.button("Clear chat", key="clear_idle", on_click=_clear_chat)
@@ -1086,38 +1131,29 @@ st.session_state["_last_qv"] = qv
 
 domain_top = classify_query_domains(domain_model, prompt, top_k=3, min_keep=1)
 
-def _score_vid_by_domains(vid:str, domain_top:List[str])->float:
-    if vid not in per_video_domain_probs or not domain_top:
+def _domain_score(vid: str) -> float:
+    if not domain_top or not per_video_domain_probs.get(vid):
         return 0.0
-    dv = per_video_domain_probs.get(vid, {})
-    return float(sum(dv.get(d,0.0) for d in domain_top) / max(1,len(domain_top)))
+    dv = per_video_domain_probs[vid]
+    return float(sum(dv.get(d, 0.0) for d in domain_top) / max(1, len(domain_top)))
 
-# Stage A routing
+# Precision slice by domain then route by summary/centroids
 topK_route = 12
 recency_weight_auto = 0.20
 half_life_auto = 270
 
+allowed_for_route = allowed_vids_all
 if domain_top and per_video_domain_probs:
-    allowed_vids_scored = [(vid, _score_vid_by_domains(vid, domain_top)) for vid in allowed_vids_all]
-    allowed_vids_scored.sort(key=lambda x:-x[1])
-    top_slice = [vid for vid,score in allowed_vids_scored if score>0]
-    if not top_slice:
-        C_use, vids_use = C, vid_list
-        allowed_for_route = allowed_vids_all
-    else:
-        slice_set = set(top_slice[:300])  # allow wider slice
-        C_use, vids_use = C, vid_list
-        allowed_for_route = slice_set
-else:
-    C_use, vids_use = C, vid_list
-    allowed_for_route = allowed_vids_all
+    MIN_DOMAIN_SCORE = 0.15
+    candidates = [(vid, _domain_score(vid)) for vid in allowed_vids_all]
+    allowed_for_route = {vid for vid, s in candidates if s >= MIN_DOMAIN_SCORE} or allowed_vids_all
 
 routed_vids = route_videos_by_summary(
-    prompt, qv, summaries, vm, C_use, list(vids_use) if vids_use else list(universe), allowed_for_route,
+    prompt, qv, summaries, vm, C, list(vid_list) if vid_list else list(universe), allowed_for_route,
     topK=topK_route, recency_weight=recency_weight_auto, half_life_days=half_life_auto, min_kw_overlap=1
 )
 if not routed_vids and domain_top and per_video_domain_probs and allowed_for_route:
-    alt = sorted(list(allowed_for_route), key=lambda v: -_score_vid_by_domains(v, domain_top))[:topK_route]
+    alt = sorted(list(allowed_for_route), key=lambda v: -_domain_score(v))[:topK_route]
     routed_vids = alt
 
 candidate_vids = set(routed_vids) if routed_vids else allowed_vids_all
@@ -1195,7 +1231,7 @@ with st.chat_message("assistant"):
     st.session_state["turns"].append(this_turn)
     _save_turn_snapshot(this_turn)
 
-    # Sources UI for this reply (collapsed by default)
+    # Sources UI for this reply
     st.markdown("---")
     with st.expander("Sources for this reply", expanded=False):
         vids = this_turn["videos"]; web = this_turn["web"]
@@ -1218,7 +1254,8 @@ with st.chat_message("assistant"):
         if web:
             with st.expander("Trusted websites", expanded=False):
                 for j, s in enumerate(web, 1):
-                    st.markdown(f"- W{j}: [{s['domain']}]({s['url']})")
+                    title = s.get("title") or s["domain"]
+                    st.markdown(f"- W{j}: [{title}]({s['url']}) · {s['domain']}")
                 if st.session_state.get("web_trace"):
                     with st.expander("Web fetch trace", expanded=False):
                         st.code(st.session_state["web_trace"])
