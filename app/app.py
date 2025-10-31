@@ -5,19 +5,14 @@ Health | Nutrition Q&A — experts-first RAG + domain routing + trusted web (Pha
 Key fixes in this build
 - Precision routing: domain-aligned slice + summary/centroid routing with keyword overlap.
 - Quote quality: keyword overlap + cosine gate; guarantee ≥2 quotes per routed video via bullets fallback.
-- Source accuracy: show timestamped YouTube links and titled trusted web links; per-turn immutable sources.
+- Source accuracy: timestamped YouTube links and titled trusted web links; per-turn immutable sources.
 - Web reliability: dual DuckDuckGo modes, title extraction, homepage fallback, and trace logging.
 - Robustness: automatic centroid renormalization, offsets persistence, turn snapshots, admin rebuilds.
-- Embedder upgrade guard: respects EMBEDDER_MODEL env (e.g., bge-base-en-v1.5, e5-base-v2), but stays compatible with existing FAISS.
-
-Infra assumptions
-- DATA_DIR points to a directory containing data/{chunks,index,catalog,domain}.
-- OPENAI_API_KEY is set in the environment.
-- Optional domain artifacts: data/domain/{domain_model.joblib, domain_probs.(json|yaml)}.
+- Embedder upgrade guard: accepts EMBEDDER_MODEL env (e.g., bge-base-en-v1.5, e5-base-v2) but stays compatible with the current FAISS index.
+- UI: removed nested expanders; use tabs under source sections to avoid StreamlitAPIException.
 """
 
 from __future__ import annotations
-
 import os
 os.environ.setdefault("TOKENIZERS_PARALLELISM","false")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY","1")
@@ -52,12 +47,10 @@ except Exception:
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
 
-# Mounted data root; all artifacts under /var/data/data/*
 DATA_ROOT = Path(os.getenv("DATA_DIR","/var/data")).resolve()
 DATA_DIR = DATA_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Core RAG artifacts
 CHUNKS_PATH     = DATA_DIR / "chunks/chunks.jsonl"
 OFFSETS_NPY     = DATA_DIR / "chunks/chunks.offsets.npy"
 INDEX_PATH      = DATA_DIR / "index/faiss.index"
@@ -67,7 +60,6 @@ VID_CENT_NPY    = DATA_DIR / "index/video_centroids.npy"
 VID_IDS_TXT     = DATA_DIR / "index/video_ids.txt"
 VID_SUM_JSON    = DATA_DIR / "catalog/video_summaries.json"
 
-# Domain routing artifacts (optional)
 DOMAIN_DIR        = DATA_DIR / "domain"
 DOMAIN_MODEL      = DOMAIN_DIR / "domain_model.joblib"
 DOMAIN_PROBS_JSON = DOMAIN_DIR / "domain_probs.json"
@@ -77,9 +69,8 @@ REQUIRED = [INDEX_PATH, METAS_PKL, CHUNKS_PATH, VIDEO_META_JSON]
 WEB_FALLBACK = os.getenv("WEB_FALLBACK","true").strip().lower() in {"1","true","yes","on"}
 
 SESSION_SNAP = DATA_ROOT / "session_last.json"
-SESSIONS_FILE = DATA_ROOT / "sessions.json"  # approx unique sessions across runtime
+SESSIONS_FILE = DATA_ROOT / "sessions.json"
 
-# ---------- Trusted domains and experts ----------
 TRUSTED_DOMAINS = [
     "nih.gov","medlineplus.gov","cdc.gov","mayoclinic.org","health.harvard.edu",
     "familydoctor.org","healthfinder.gov","ama-assn.org","medicalxpress.com",
@@ -132,7 +123,8 @@ def _iso(ts: float) -> str:
     except Exception: return "n/a"
 
 def _yt_ts_url(url:str, start_sec:float)->str:
-    if not url: return ""
+    if not url:
+        return ""
     s = int(max(0, round(start_sec)))
     join = "&" if "?" in url else "?"
     return f"{url}{join}t={s}s"
@@ -234,7 +226,6 @@ def _canonicalize_creator(name: str) -> str | None:
 # ---------- LLM answer streaming ----------
 def stream_openai_answer(model_name: str, question: str, history, grouped_video_block: str,
                          web_snips: list[dict], no_video: bool):
-    """Stream tokens to the UI. All claims must cite provided evidence."""
     if not os.getenv("OPENAI_API_KEY"):
         yield "⚠️ OPENAI_API_KEY is not set."
         return
@@ -257,12 +248,12 @@ def stream_openai_answer(model_name: str, question: str, history, grouped_video_
         "Priority: (1) grouped VIDEO quotes from allowed experts, (2) trusted WEB.\n"
         + fallback_line +
         "Rules:\n"
-        "• Cite every claim/step: (Video k) per video, (DOMAIN Wj) for web.\n"
+        "• Cite every claim: (Video k) per video, (DOMAIN Wj) for web.\n"
         "• Flag animal/in-vitro/mechanistic vs human clinical.\n"
         "• Normalize units; include numeric effect sizes if present.\n"
         "• Give practical options with mechanisms; 'dose not specified' if absent. No diagnosis.\n"
         "Structure: Key summary • Practical protocol • Safety notes.\n"
-        "Do not invent claims beyond the provided evidence."
+        "Do not invent beyond the evidence."
     )
 
     user_payload = (("Recent conversation:\n"+"\n".join(convo)+"\n\n") if convo else "") + \
@@ -300,7 +291,7 @@ def _recency_score(published_ts:float, now:float, half_life_days:float)->float:
     days=max(0.0,(now-published_ts)/86400.0)
     return 0.5 ** (days / max(1e-6, half_life_days))
 
-# ---------- JSONL offsets for random access ----------
+# ---------- JSONL offsets ----------
 def _ensure_offsets()->np.ndarray:
     if OFFSETS_NPY.exists():
         try:
@@ -331,16 +322,10 @@ def iter_jsonl_rows(indices:List[int], limit:int|None=None):
 # ---------- Model + FAISS ----------
 @st.cache_resource(show_spinner=False)
 def _load_embedder(model_name:str)->SentenceTransformer:
-    # Accept any sentence-transformers compatible model path or hub id
     return SentenceTransformer(model_name, device="cpu")
 
 @st.cache_resource(show_spinner=False)
 def load_metas_and_model(index_path:Path=INDEX_PATH, metas_path:Path=METAS_PKL):
-    """
-    Load FAISS and the embedder. Stay compatible with the existing index unless EMBEDDER_MODEL overrides.
-    - If EMBEDDER_MODEL is set, we try to load it. If its dim != index.d, we fallback to the model in metas.pkl.
-    - To fully upgrade to bge-base-en-v1.5 or e5-base-v2, rebuild FAISS with that model and set metas.pkl['model'] accordingly.
-    """
     if not index_path.exists() or not metas_path.exists(): return None, None, None
     index = faiss.read_index(str(index_path))
     with metas_path.open("rb") as f:
@@ -357,30 +342,26 @@ def load_metas_and_model(index_path:Path=INDEX_PATH, metas_path:Path=METAS_PKL):
         except Exception:
             return None, None
 
-    # prefer override if dimension matches, else fallback to meta
     if env_override:
         emb, dim = _try_model(env_override)
         if emb and dim == idx_dim:
             return index, payload.get("metas",[]), {"model_name":env_override, "embedder":emb}
 
-    # try meta model
     emb, dim = _try_model(model_from_meta)
     if emb and dim == idx_dim:
         return index, payload.get("metas",[]), {"model_name":model_from_meta, "embedder":emb}
 
-    # last resort: local MiniLM if stored under data/models
     local_dir = DATA_DIR/"models"/"all-MiniLM-L6-v2"
     try_name = str(local_dir) if (local_dir/"config.json").exists() else model_from_meta
     emb, dim = _try_model(try_name)
     if not emb or dim != idx_dim:
-        raise RuntimeError(f"Embedding dim mismatch. FAISS={idx_dim}. Override EMBEDDER_MODEL='{env_override}' or rebuild index.")
+        raise RuntimeError(f"Embedding dim mismatch. FAISS={idx_dim}. Override EMBEDDER_MODEL or rebuild index.")
     return index, payload.get("metas",[]), {"model_name":try_name, "embedder":emb}
 
 @st.cache_resource(show_spinner=False)
 def load_video_centroids():
     if not (VID_CENT_NPY.exists() and VID_IDS_TXT.exists()): return None, None
     C = np.load(VID_CENT_NPY).astype("float32")
-    # automatic renormalization to unit length
     if C.ndim==2 and C.size>0:
         n = np.linalg.norm(C,axis=1,keepdims=True) + 1e-12
         C = C / n
@@ -492,7 +473,7 @@ def _quote_relevance_ok(query:str, quote:str, qv:np.ndarray, embedder:SentenceTr
         cos = float(np.dot(qv, t_vec))
         return cos >= min_cos
     except Exception:
-        return True  # fallback to overlap only
+        return True
 
 # ---------- Summary-aware routing ----------
 def _build_idf_over_bullets(summaries: dict) -> dict:
@@ -628,13 +609,6 @@ def build_grouped_evidence_for_prompt(
     routed_vids: List[str], max_quotes:int=3,
     qv: np.ndarray | None = None, embedder: SentenceTransformer | None = None
 ) -> Tuple[str, Dict[str, Any]]:
-    """
-    Build grouped, timestamped evidence for the LLM and UI.
-    - Keep routed order.
-    - Strict quote gate: keyword overlap and cosine to query.
-    - Guarantee ≥2 quotes per routed video via summary bullets fallback.
-    - Always include a playable YouTube timestamp link when url is known.
-    """
     groups = group_hits_by_video(hits)
     order_vids, seen = [], set()
     for v in routed_vids:
@@ -681,7 +655,6 @@ def build_grouped_evidence_for_prompt(
             export.append({"video_id":vid,"title":title,"creator":creator,"ts":ts,"text":q,"url": _yt_ts_url(base_url, t0)})
             used+=1
 
-        # fallback 1: summary bullets to guarantee at least two quotes
         need = max(0, max(2, min(2, max_quotes)) - used)
         if need > 0:
             for b in _first_bullets(vid, summaries or {}, k=need+1):
@@ -695,7 +668,6 @@ def build_grouped_evidence_for_prompt(
                 used+=1
                 if used>=max_quotes: break
 
-        # fallback 2: top raw chunk if still empty
         if used==0 and items:
             h=items[0]
             t0=float((h.get("meta") or {}).get("start",0))
@@ -713,7 +685,7 @@ def _ddg_html(domain:str, query:str, headers:dict, timeout:float)->List[str]:
     try:
         r=requests.get("https://duckduckgo.com/html/", params={"q":f"site:{domain} {query}"}, headers=headers, timeout=timeout)
         if r.status_code!=200: return []
-        soup=BeautifulSoup(r.text,"htmlparser") if False else BeautifulSoup(r.text,"html.parser")
+        soup=BeautifulSoup(r.text,"html.parser")
         return [a.get("href") for a in soup.select("a.result__a") if a.get("href")]
     except Exception:
         return []
@@ -729,9 +701,6 @@ def _ddg_lite(domain:str, query:str, headers:dict, timeout:float)->List[str]:
 
 def fetch_trusted_snippets(query: str, allowed_domains: List[str],
                            max_snippets: int = 3, per_domain: int = 1, timeout: float = 6.0):
-    """
-    Return [{domain, url, title, text}], at least 1 per domain, up to max_snippets. Logs trace.
-    """
     trace, out = [], []
     if not requests or not BeautifulSoup or max_snippets <= 0:
         st.session_state["web_trace"] = "requests/bs4 unavailable."
@@ -757,7 +726,7 @@ def fetch_trusted_snippets(query: str, allowed_domains: List[str],
                 if r.status_code != 200:
                     trace.append(f"{domain}: {url} status {r.status_code}")
                     continue
-                soup = BeautifulSoup(r.text, "htmlparser") if False else BeautifulSoup(r.text, "html.parser")
+                soup = BeautifulSoup(r.text, "html.parser")
                 title = _normalize_text(soup.title.get_text(strip=True) if soup.title else "")
                 paras = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
                 text = _normalize_text(" ".join(paras))[:1800]
@@ -872,7 +841,7 @@ def _path_exists_report()->Dict[str, Any]:
         "domain_probs_yaml": str(DOMAIN_PROBS_YAML), "domain_probs_yaml_exists": DOMAIN_PROBS_YAML.exists(),
     }
 
-# ---------- Approx unique sessions tracking ----------
+# ---------- Sessions ----------
 def _get_or_make_session_id()->str:
     if "_session_uuid" not in st.session_state:
         st.session_state["_session_uuid"]=str(uuid.uuid4())
@@ -903,7 +872,6 @@ def _unique_sessions_count()->int:
     except Exception:
         return 0
 
-# ---------- Session snapshot ----------
 def _save_turn_snapshot(turn:dict):
     try:
         SESSION_SNAP.write_text(json.dumps(turn, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -943,17 +911,14 @@ def build_creator_indexes_from_chunks(vm: dict) -> tuple[dict, dict]:
 st.set_page_config(page_title="Health | Nutrition Q&A", page_icon="🍎", layout="wide")
 st.title("Health | Nutrition Q&A")
 
-# Persist per-turn sources and messages
 if "turns" not in st.session_state: st.session_state["turns"]=[]
 if "messages" not in st.session_state: st.session_state["messages"]=[]
 
-# Track session hits for admin unique sessions metric
 _record_session_hit()
 
 with st.sidebar:
     st.markdown("**Auto Mode** · accuracy and diversity enabled")
 
-    # Experts checklist
     vm = load_video_meta()
     vid_to_creator, creator_to_vids = build_creator_indexes_from_chunks(vm)
     counts={canon: len(creator_to_vids.get(canon,set())) for canon in ALLOWED_CREATORS}
@@ -968,7 +933,6 @@ with st.sidebar:
     selected_creators:set[str]=set(selected_creators_list)
     st.session_state["selected_creators"]=selected_creators
 
-    # Trusted sites
     st.subheader("Trusted sites")
     st.caption("Short excerpts from vetted medical sites are added as supporting evidence.")
     allow_web = st.checkbox("Include supporting website excerpts", value=True,
@@ -977,16 +941,14 @@ with st.sidebar:
     for i,dom in enumerate(TRUSTED_DOMAINS):
         if st.checkbox(dom, value=True, key=f"site_{i}", help="Allow fetching supporting evidence from this domain."):
             selected_domains.append(dom)
-    max_web_auto = 3  # will ensure at least 2 via backfill
+    max_web_auto = 3
 
-    # Model choice
     model_choice = st.selectbox(
         "Answering model",
         ["gpt-4o","gpt-4o-mini","gpt-4.1-mini"], index=0,
         help="Model used to compose the final answer from the selected evidence."
     )
 
-    # Advanced
     with st.expander("Advanced (technical controls)", expanded=False):
         st.caption("Defaults are tuned.")
         st.number_input("Scan candidates first (K)", 128, 5000, 768, 64, key="adv_scanK")
@@ -1008,14 +970,12 @@ with st.sidebar:
     cent_ready = VID_CENT_NPY.exists() and VID_IDS_TXT.exists() and VID_SUM_JSON.exists()
     st.checkbox("centroids+ids+summaries present", value=cent_ready, disabled=True)
 
-# Diagnostics short header
 if show_diag:
     colA,colB,colC = st.columns([2,3,3])
     with colA: st.caption(f"DATA_DIR = `{DATA_ROOT}`")
     with colB: st.caption(f"chunks mtime: {_iso(_file_mtime(CHUNKS_PATH)) if CHUNKS_PATH.exists() else 'missing'}")
     with colC: st.caption(f"index mtime: {_iso(_file_mtime(INDEX_PATH)) if INDEX_PATH.exists() else 'missing'}")
 
-# Render prior chat
 for m in st.session_state["messages"]:
     with st.chat_message(m["role"]): st.markdown(m["content"])
 
@@ -1063,29 +1023,38 @@ if prompt is None:
                 st.markdown(t.get("answer",""))
                 vids = t.get("videos",[])
                 web  = t.get("web",[])
-                if vids:
-                    with st.expander("Video quotes", expanded=False):
-                        cur_vid = None
+                tabs = st.tabs(["Video quotes","Trusted websites","Web fetch trace"])
+                with tabs[0]:
+                    if vids:
+                        cur_vid=None
                         vm_prev = load_video_meta()
                         for v in vids:
                             if v.get("video_id")!=cur_vid:
                                 meta = vm_prev.get(v.get("video_id",""),{})
-                                link = meta.get("url","")
+                                link = meta.get("url","") or f"https://www.youtube.com/watch?v={v.get('video_id','')}"
                                 hdr = f"- **{v.get('title','')}** — _{v.get('creator','')}_"
                                 st.markdown(f"{hdr}" + (f"  •  [{link}]({link})" if link else ""))
                                 cur_vid = v.get("video_id")
-                            if v.get("url"):
-                                st.markdown(f"  • **{v.get('ts','')}** — “{_normalize_text(v.get('text',''))[:180]}”  ·  [{v.get('url')}]({v.get('url')})")
+                            url = v.get("url") or ""
+                            if url:
+                                st.markdown(f"  • **{v.get('ts','')}** — “{_normalize_text(v.get('text',''))[:180]}”  ·  [{url}]({url})")
                             else:
                                 st.markdown(f"  • **{v.get('ts','')}** — “{_normalize_text(v.get('text',''))[:180]}”")
-                if web:
-                    with st.expander("Trusted websites", expanded=False):
+                    else:
+                        st.caption("No video quotes saved for this turn.")
+                with tabs[1]:
+                    if web:
                         for j, s in enumerate(web, 1):
                             title = s.get("title") or s["domain"]
                             st.markdown(f"- W{j}: [{title}]({s['url']}) · {s['domain']}")
-                        if st.session_state.get("web_trace"):
-                            with st.expander("Web fetch trace", expanded=False):
-                                st.code(st.session_state["web_trace"])
+                    else:
+                        st.caption("No trusted web snippets saved for this turn.")
+                with tabs[2]:
+                    trace = t.get("web_trace","")
+                    if trace:
+                        st.code(trace)
+                    else:
+                        st.caption("No fetch trace recorded.")
     cols=st.columns([1]*12)
     with cols[-1]:
         st.button("Clear chat", key="clear_idle", on_click=_clear_chat)
@@ -1095,7 +1064,7 @@ if prompt is None:
 st.session_state["messages"].append({"role":"user","content":prompt})
 with st.chat_message("user"): st.markdown(prompt)
 
-# Guardrails: required files
+# Guardrails
 missing=[p for p in REQUIRED if not p.exists()]
 if missing:
     with st.chat_message("assistant"):
@@ -1109,7 +1078,6 @@ except Exception as e:
     with st.chat_message("assistant"):
         st.error("Failed to load index or encoder."); st.exception(e); st.stop()
 embedder: SentenceTransformer = payload["embedder"]
-# pre-warm encode
 try: embedder.encode(["warmup"], normalize_embeddings=True)
 except Exception: pass
 
@@ -1118,13 +1086,13 @@ C, vid_list = load_video_centroids()
 summaries = load_video_summaries() or {}
 domain_model, per_video_domain_probs, domain_set = load_domain_model()
 
-# Selected experts → allowed video universe
+# Selected experts
 vid_to_creator, creator_to_vids = build_creator_indexes_from_chunks(vm)
 universe = set(vid_list or list(vm.keys()) or list(vid_to_creator.keys()))
 chosen = st.session_state.get("selected_creators", set(ALLOWED_CREATORS))
 allowed_vids_all = {vid for vid in universe if vid_to_creator.get(vid) in chosen}
 
-# Domain routing for this query
+# Domain routing
 qv = embedder.encode([prompt], normalize_embeddings=True).astype("float32")[0]
 st.session_state["_last_query"] = prompt
 st.session_state["_last_qv"] = qv
@@ -1137,7 +1105,6 @@ def _domain_score(vid: str) -> float:
     dv = per_video_domain_probs[vid]
     return float(sum(dv.get(d, 0.0) for d in domain_top) / max(1, len(domain_top)))
 
-# Precision slice by domain then route by summary/centroids
 topK_route = 12
 recency_weight_auto = 0.20
 half_life_auto = 270
@@ -1158,7 +1125,7 @@ if not routed_vids and domain_top and per_video_domain_probs and allowed_for_rou
 
 candidate_vids = set(routed_vids) if routed_vids else allowed_vids_all
 
-# Auto recall defaults (overridable)
+# Recall knobs
 K_scan = st.session_state.get("adv_scanK", 768)
 K_use  = st.session_state.get("adv_useK", 48)
 min_distinct_videos = 3
@@ -1169,7 +1136,7 @@ mmr_lambda = st.session_state.get("adv_lam", 0.45)
 recency_weight = st.session_state.get("adv_rec", recency_weight_auto)
 half_life = st.session_state.get("adv_hl", half_life_auto)
 
-# Stage B: search chunks only in routed videos
+# Stage B
 with st.spinner("Scanning selected videos…"):
     try:
         hits = stageB_search_chunks(
@@ -1183,7 +1150,7 @@ with st.spinner("Scanning selected videos…"):
         with st.chat_message("assistant"):
             st.error("Search failed."); st.exception(e); st.stop()
 
-# Trusted web support: ensure at least 2 snippets when enabled
+# Trusted web
 web_snips=[]
 if allow_web and requests and BeautifulSoup and int(max_web_auto)>0:
     with st.spinner("Fetching trusted websites…"):
@@ -1217,10 +1184,8 @@ with st.chat_message("assistant"):
                                    grouped_block, web_snips, no_video=(len(export_struct["videos"])==0))
         ans = st.write_stream(gen)
 
-    # Answer saved to chat history
     st.session_state["messages"].append({"role":"assistant","content":ans})
 
-    # Persist sources for THIS reply only
     this_turn = {
         "prompt": prompt,
         "answer": ans,
@@ -1231,36 +1196,41 @@ with st.chat_message("assistant"):
     st.session_state["turns"].append(this_turn)
     _save_turn_snapshot(this_turn)
 
-    # Sources UI for this reply
     st.markdown("---")
     with st.expander("Sources for this reply", expanded=False):
         vids = this_turn["videos"]; web = this_turn["web"]
-
-        if vids:
-            with st.expander("Video quotes", expanded=False):
+        tabs = st.tabs(["Video quotes","Trusted websites","Web fetch trace"])
+        with tabs[0]:
+            if vids:
                 cur_vid=None
                 for v in vids:
                     if v.get("video_id")!=cur_vid:
                         meta = vm.get(v.get("video_id",""),{})
-                        link = meta.get("url","")
+                        link = meta.get("url","") or f"https://www.youtube.com/watch?v={v.get('video_id','')}"
                         hdr = f"- **{v.get('title','')}** — _{v.get('creator','')}_"
                         st.markdown(f"{hdr}" + (f"  •  [{link}]({link})" if link else ""))
                         cur_vid = v.get("video_id")
-                    if v.get("url"):
-                        st.markdown(f"  • **{v.get('ts','')}** — “{_normalize_text(v.get('text',''))[:180]}”  ·  [{v.get('url')}]({v.get('url')})")
+                    url = v.get("url") or ""
+                    if url:
+                        st.markdown(f"  • **{v.get('ts','')}** — “{_normalize_text(v.get('text',''))[:180]}”  ·  [{url}]({url})")
                     else:
                         st.markdown(f"  • **{v.get('ts','')}** — “{_normalize_text(v.get('text',''))[:180]}”")
-
-        if web:
-            with st.expander("Trusted websites", expanded=False):
+            else:
+                st.caption("No video quotes used.")
+        with tabs[1]:
+            if web:
                 for j, s in enumerate(web, 1):
                     title = s.get("title") or s["domain"]
                     st.markdown(f"- W{j}: [{title}]({s['url']}) · {s['domain']}")
-                if st.session_state.get("web_trace"):
-                    with st.expander("Web fetch trace", expanded=False):
-                        st.code(st.session_state["web_trace"])
+            else:
+                st.caption("No trusted web snippets.")
+        with tabs[2]:
+            trace = this_turn.get("web_trace","")
+            if trace:
+                st.code(trace)
+            else:
+                st.caption("No fetch trace recorded.")
 
-# Footer + Clear chat
 cols=st.columns([1]*12)
 with cols[-1]:
     st.button("Clear chat", key="clear_done", on_click=_clear_chat)
