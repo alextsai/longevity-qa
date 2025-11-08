@@ -1,21 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Health | Nutrition Q&A — experts-first RAG + domain routing + trusted web
+Health | Nutrition Q&A — experts-first RAG with robust retrieval, routing, and trusted web
 
-Core features:
-- Stable labels [V1]..[Vn] with optional @mm:ss; UI mirrors labels in a tabbed source panel.
-- No nested expanders (Streamlit error fixed). Sources use tabs; only sub-bullets per video.
-- Precise routing (domain slice + summary/centroid), quote quality gates, MMR.
-- Centroid renormalization, offsets persistence, turn snapshots, admin rebuilds.
-- Embedder upgrade guard: honors EMBEDDER_MODEL if FAISS dim matches.
-- Unique USERS (cookie + SQLite), not sessions.
-- Video titles rendered next to [V#] in both history and current-turn source tabs.
-
-Quality upgrades in this revision:
-- Larger and more diverse recall (higher K, more videos; hybrid keyword booster).
-- Optional cross-encoder re-ranking (if available).
-- Trusted websites return query-aligned sentence passages with links and titles.
-- Stricter system prompt for concrete, per-claim-cited answers.
+v3 upgrades:
+- Hybrid recall: FAISS + BM25 with medical synonyms; optional cross-encoder re-rank
+- Bigram-aware summary builder for routing; mild recency; topic-weighted creator priors
+- Quote quality gates + ±12s context window per quote; conflict surfacing across sources
+- Trusted-web fetch: query rewrites, title-overlap gate, 2-term passage minimum
+- Strict LLM prompt requiring per-claim inline citations; structured output
+- Unique USERS via encrypted cookie + SQLite; evidence telemetry in UI
 
 DATA_DIR must contain data/{chunks,index,catalog,domain}. OPENAI_API_KEY must be set.
 """
@@ -84,7 +77,7 @@ VID_SUM_JSON    = DATA_DIR / "catalog/video_summaries.json"
 
 DOMAIN_DIR        = DATA_DIR / "domain"
 DOMAIN_MODEL      = DOMAIN_DIR / "domain_model.joblib"
-DOMAIN_PROBS_JSON = DOMAIN_DIR / "domain_probs.json"
+DOMAIN_PROBS_JSON = DOMAIN_DIR / "domain/domain_probs.json"
 DOMAIN_PROBS_YAML = DATA_DIR / "domain/domain_probs.yaml"
 
 REQUIRED = [INDEX_PATH, METAS_PKL, CHUNKS_PATH, VIDEO_META_JSON]
@@ -112,6 +105,31 @@ ALLOWED_CREATORS = [
 EXCLUDED_CREATORS_EXACT = {
     "they diary of a ceo and louse tomlinson",
     "dr. pradip jamnadas, md and the primal podcast",
+}
+
+# Topic-weighted creator priors (soft multipliers; 1.0 neutral)
+CREATOR_PRIORS = {
+    "longevity": {
+        "Peter Attia MD": 1.35,
+        "Andrew Huberman": 1.20,
+        "Healthy Immune Doc": 1.10,
+    },
+    "nutrition": {
+        "Healthy Immune Doc": 1.35,
+        "Andrew Huberman": 1.20,
+        "Peter Attia MD": 1.10,
+    },
+    "cardiac": {
+        "Peter Attia MD": 1.35,
+        "Dr. Pradip Jamnadas, MD": 1.30,
+        "Andrew Huberman": 1.15,
+        "The Diary of A CEO": 1.05,
+    },
+}
+TOPIC_KEYWORDS = {
+    "longevity": ["longevity","lifespan","healthspan","aging","vo2","zone","grip","dexascan","apoa"],
+    "nutrition": ["food","diet","nutrition","protein","fiber","glycemic","supplement","omega","magnesium","electrolyte"],
+    "cardiac": ["heart","cardiac","coronary","bypass","stent","ischemia","apob","ldl","hdl","statin","pcsk9","hypertension","bp"],
 }
 
 # ---------- Small utils ----------
@@ -247,6 +265,26 @@ def _canonicalize_creator(name: str) -> str | None:
             return canon
     return None
 
+# ---------- Topic hint and priors ----------
+def infer_topic(q:str, domain_top:List[str]) -> str | None:
+    ql = q.lower()
+    if domain_top:
+        d0 = domain_top[0].lower()
+        if any(x in d0 for x in ["card","cv","heart"]): return "cardiac"
+        if any(x in d0 for x in ["nutri","diet"]): return "nutrition"
+        if any(x in d0 for x in ["long","aging"]): return "longevity"
+    scores = {k:0 for k in TOPIC_KEYWORDS}
+    for k,kws in TOPIC_KEYWORDS.items():
+        scores[k] = sum(1 for w in kws if w in ql)
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else None
+
+def creator_prior_for_vid(vid:str, topic:str|None, vm:dict, vid_to_creator:dict, gain:float=1.0) -> float:
+    if not topic: return 1.0
+    pri = CREATOR_PRIORS.get(topic, {})
+    creator = vid_to_creator.get(vid) or _canonicalize_creator(_raw_creator_of_vid(vid, vm)) or ""
+    return float(pri.get(creator, 1.0)) ** float(gain)
+
 # ---------- LLM answer streaming ----------
 def stream_openai_answer(model_name: str, question: str, history, grouped_video_block: str,
                          web_snips: list[dict], no_video: bool):
@@ -272,24 +310,23 @@ def stream_openai_answer(model_name: str, question: str, history, grouped_video_
         "Citations:\n"
         "• Videos: [V1], [V2], ... Optionally add @mm:ss, e.g., [V2@09:06].\n"
         "• Web: (W1), (W2), ...\n"
-        "Rules for content quality:\n"
-        "1) Be specific. Prefer concrete protocols (dosage ranges, timing, frequency) when present in evidence.\n"
-        "2) If a claim is not in evidence, do NOT include it.\n"
-        "3) Tie each non-obvious sentence to a citation immediately at the end.\n"
-        "4) If video evidence conflicts, surface the conflict in one bullet with both citations.\n"
+        "Rules:\n"
+        "1) Be specific. Prefer concrete protocols when present.\n"
+        "2) If a claim is not in evidence, omit it.\n"
+        "3) Put the citation at the end of the sentence it supports.\n"
+        "4) If sources conflict, surface the conflict in one bullet with both citations.\n"
         "5) If videos are weak but web is strong, start with 'Web-supported answer'. If no videos, start with 'Web-only evidence'.\n"
-        "6) No generic advice. Only what evidence supports.\n"
-        "Output structure:\n"
+        "Output:\n"
         "• Key Findings (3–6 bullets)\n"
         "• Practical Protocol (ordered steps)\n"
-        "• Gaps / What to Validate (unknowns, thresholds, tests)\n"
+        "• Gaps / What to Validate (unknowns or next tests)\n"
     ) + fallback_line
 
     user_payload = (("Recent conversation:\n"+"\n".join(convo)+"\n\n") if convo else "") + \
                    f"Question: {question}\n\n" + \
                    "Video Evidence (labeled):\n" + (grouped_video_block or "None") + "\n\n" + \
                    "Trusted Web Snippets:\n" + web_block + "\n\n" + \
-                   "Return succinct bullets with per-claim citations, and avoid generic safety language unless directly supported."
+                   "Return succinct bullets with per-claim citations."
 
     client = OpenAI(timeout=60)
     try:
@@ -468,7 +505,7 @@ def classify_query_domains(model, query:str, top_k:int=3, min_keep:int=1)->List[
     except Exception:
         return []
 
-# ---------- MMR + quote filters ----------
+# ---------- Retrieval helpers ----------
 def mmr(qv:np.ndarray, doc_vecs:np.ndarray, k:int, lambda_diversity:float=0.45)->List[int]:
     if doc_vecs.size==0: return []
     sim=(doc_vecs @ qv.reshape(-1,1)).ravel()
@@ -506,7 +543,7 @@ def _dedupe_passages(items:List[Dict[str,Any]], time_window_sec:float=8.0, min_c
     return out
 
 def _quote_relevance_ok(query:str, quote:str, qv:np.ndarray, embedder:SentenceTransformer,
-                        min_overlap:int=3, min_cos:float=0.35)->bool:
+                        min_overlap:int=2, min_cos:float=0.30)->bool:
     if _kw_overlap(query, quote) < min_overlap:
         return False
     try:
@@ -515,6 +552,49 @@ def _quote_relevance_ok(query:str, quote:str, qv:np.ndarray, embedder:SentenceTr
         return cos >= min_cos
     except Exception:
         return True
+
+# ---------- Context window + conflict detection ----------
+def _read_context_window(vid: str, t0: float, window: float = 12.0) -> str:
+    if not CHUNKS_PATH.exists():
+        return ""
+    lo, hi = max(0.0, t0-window), t0+window
+    ctx = []
+    with CHUNKS_PATH.open(encoding="utf-8") as f:
+        for ln in f:
+            try:
+                j = json.loads(ln)
+            except:
+                continue
+            m = (j.get("meta") or {})
+            v = (m.get("video_id") or m.get("vid") or m.get("ytid") or
+                 j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id"))
+            if v != vid:
+                continue
+            ts = _parse_ts(m.get("start", m.get("start_sec", 0)))
+            if lo <= ts <= hi:
+                t = _normalize_text(j.get("text",""))
+                if t:
+                    ctx.append(t)
+    return _normalize_text(" ".join(ctx))[:600]
+
+def _detect_conflicts(quotes: List[dict]) -> List[Tuple[str,str]]:
+    if not quotes:
+        return []
+    buckets = collections.defaultdict(list)
+    for q in quotes:
+        txt = (q.get("text") or "").lower()
+        lab = q.get("label","?")
+        if any(w in txt for w in ["increase hdl","raise hdl"]): buckets["hdl_up"].append(lab)
+        if any(w in txt for w in ["decrease hdl","lower hdl"]): buckets["hdl_down"].append(lab)
+        if any(w in txt for w in ["raise ldl","increase ldl"]): buckets["ldl_up"].append(lab)
+        if any(w in txt for w in ["lower ldl","decrease ldl"]): buckets["ldl_down"].append(lab)
+        if any(w in txt for w in ["fasting good","benefit fasting","recommend fasting"]): buckets["fast_yes"].append(lab)
+        if any(w in txt for w in ["fasting bad","avoid fasting","not recommend fasting"]): buckets["fast_no"].append(lab)
+    conflicts=[]
+    if buckets.get("hdl_up") and buckets.get("hdl_down"): conflicts.append(("HDL", f"{len(buckets['hdl_up'])} vs {len(buckets['hdl_down'])}"))
+    if buckets.get("ldl_up") and buckets.get("ldl_down"): conflicts.append(("LDL", f"{len(buckets['ldl_up'])} vs {len(buckets['ldl_down'])}"))
+    if buckets.get("fast_yes") and buckets.get("fast_no"): conflicts.append(("Fasting", f"{len(buckets['fast_yes'])} vs {len(buckets['fast_no'])}"))
+    return conflicts
 
 # ---------- Summary-aware routing ----------
 def _build_idf_over_bullets(summaries: dict) -> dict:
@@ -563,50 +643,91 @@ def route_videos_by_summary(
         rec = _recency_score(_vid_epoch(vm, v), now, half_life_days)
         base = 0.6*cs + 0.3*kw
         score = (1.0 - recency_weight)*base + recency_weight*(0.1*rec + 0.9*base)
+        # Topic-weighted creator prior
+        score *= creator_prior_for_vid(v, st.session_state.get("_topic_hint"), vm,
+                                       st.session_state.get("_vid_to_creator_cache", {}), gain=float(st.session_state.get("_prior_gain",1.0)))
         scored.append((v, score))
     scored.sort(key=lambda x:-x[1])
     return [v for v,_ in scored[:int(topK)]]
 
-# ---------- Stage A: simple keyword booster over chunks ----------
-def stageA_keyword_boost(query: str, allowed_vids: Set[str] | None, max_lines: int = 2000, top_per_video: int = 2):
+# ---------- Stage A: BM25 keyword booster with synonyms ----------
+MED_SYNONYMS = {
+    "apob": ["apo b","apolipoprotein b"],
+    "ldl": ["low density lipoprotein","bad cholesterol"],
+    "hdl": ["high density lipoprotein","good cholesterol"],
+    "statin": ["atorvastatin","rosuvastatin","statins"],
+    "pcsk9": ["evolocumab","alirocumab","repatha","praluent"],
+    "hrv": ["heart rate variability"],
+    "fasting": ["time restricted feeding","intermittent fasting","time-restricted eating","tre"],
+    "fiber": ["soluble fiber","insoluble fiber","psyllium"],
+    "omega": ["epa","dha","fish oil","algal oil"],
+    "magnesium": ["magnesium glycinate","magnesium citrate","mg"],
+}
+def _expand_query_terms(q: str) -> Set[str]:
+    toks = set(re.findall(r"[a-z0-9]+", q.lower()))
+    out = set(toks)
+    for k, syns in MED_SYNONYMS.items():
+        if k in toks:
+            for s in syns:
+                out |= set(re.findall(r"[a-z0-9]+", s.lower()))
+    return out
+
+def stageA_keyword_boost(query: str, allowed_vids: Set[str] | None,
+                         max_scan:int = 4000, top_per_video:int = 3):
     if not CHUNKS_PATH.exists(): 
         return []
-    qtok = set(re.findall(r"[a-z0-9]+", (query or "").lower()))
-    kept = []
+    qtok = _expand_query_terms(query)
+
     offs = _ensure_offsets()
-    step = max(1, len(offs) // max_lines)
+    step = max(1, len(offs) // max_scan)
+    DF = collections.Counter(); corpus = []
     with CHUNKS_PATH.open("rb") as f:
         for i in range(0, len(offs), step):
-            f.seek(int(offs[i]))
-            raw = f.readline()
-            try:
-                j = json.loads(raw)
-            except:
-                continue
-            t = _normalize_text(j.get("text",""))
-            if not t:
-                continue
+            f.seek(int(offs[i])); raw = f.readline()
+            try: j = json.loads(raw)
+            except: continue
+            t = _normalize_text(j.get("text","")); 
+            if not t: continue
             m = (j.get("meta") or {})
             vid = (m.get("video_id") or m.get("vid") or m.get("ytid") or
                    j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id"))
-            if not vid:
+            if not vid or (allowed_vids and vid not in allowed_vids): 
                 continue
-            if allowed_vids is not None and vid not in allowed_vids:
+            words = re.findall(r"[a-z0-9]+", t.lower())
+            if not words: 
                 continue
-            toks = set(re.findall(r"[a-z0-9]+", t.lower()))
-            overlap = len(qtok & toks)
-            if overlap < 3:
-                continue
+            tokens = collections.Counter(words)
+            for w in set(words): DF[w]+=1
             start = _parse_ts(m.get("start", m.get("start_sec", 0)))
-            kept.append({"score": overlap, "text": t, "meta": {"video_id": vid, "start": start}})
-    per = {}
-    out = []
-    for h in sorted(kept, key=lambda r: (-r["score"], float(r["meta"].get("start",0)))):
-        vid = h["meta"]["video_id"]
-        per[vid] = per.get(vid, 0) + 1
-        if per[vid] <= top_per_video:
-            out.append({"i": -1, "score": float(h["score"]), "text": h["text"], "meta": h["meta"]})
-    return out[:200]
+            corpus.append((tokens, vid, start, t))
+
+    N = max(1,len(corpus)); avgdl = sum(sum(tok.values()) for tok,_,_,_ in corpus)/N
+    def bm25(tok_counter:dict)->float:
+        k1, b = 1.5, 0.75
+        dl = sum(tok_counter.values())
+        score = 0.0
+        for w in qtok:
+            if DF.get(w,0)==0: 
+                continue
+            tf = tok_counter.get(w,0)
+            idf = math.log( (N - DF[w] + 0.5) / (DF[w] + 0.5) + 1e-9 )
+            num = tf * (k1 + 1.0)
+            den = tf + k1 * (1.0 - b + b * (dl/avgdl + 1e-9))
+            score += idf * (num / (den + 1e-9))
+        return score
+
+    per = {}; kept=[]
+    for tok, vid, start, text in corpus:
+        s = bm25(tok)
+        if s <= 0: 
+            continue
+        per[vid] = per.get(vid,0)
+        if per[vid] >= top_per_video:
+            continue
+        per[vid]+=1
+        kept.append({"i":-1,"score":float(s),"text":text,"meta":{"video_id":vid,"start":start}})
+    kept.sort(key=lambda r: -r["score"])
+    return kept[:300]
 
 # ---------- Stage B recall ----------
 def stageB_search_chunks(query:str,
@@ -715,7 +836,7 @@ def build_grouped_evidence_for_prompt(
         if qv is not None and embedder is not None:
             for h in clean:
                 q = _normalize_text(h.get("text",""))
-                if _quote_relevance_ok(query_txt, q, qv, embedder, min_overlap=3, min_cos=0.35):
+                if _quote_relevance_ok(query_txt, q, qv, embedder, min_overlap=2, min_cos=0.30):
                     kept.append(h)
         else:
             kept = clean
@@ -727,6 +848,8 @@ def build_grouped_evidence_for_prompt(
             q=_normalize_text(h.get("text",""))
             lines.append(f"[{label_map[vid]}] {ts}: “{q[:260]}”")
             export.append({"video_id":vid,"label":label_map[vid],"ts":ts,"text":q,"url": _yt_ts_url(base_url, t0)})
+            # attach context for LLM precision
+            export[-1]["context"] = _read_context_window(vid, t0)
             used+=1
 
         if used < 2:
@@ -738,7 +861,7 @@ def build_grouped_evidence_for_prompt(
                     parts = [float(x) for x in ts_txt.split(":")]
                     try_sec = sum(p * (60 ** i) for i, p in enumerate(reversed(parts)))
                 lines.append(f"[{label_map[vid]}] {ts_txt}: “{b['text'][:260]}”")
-                export.append({"video_id":vid,"label":label_map[vid],"ts":ts_txt,"text":b["text"],"url": _yt_ts_url(base_url, try_sec)})
+                export.append({"video_id":vid,"label":label_map[vid],"ts":ts_txt,"text":b["text"],"url": _yt_ts_url(base_url, try_sec), "context": ""})
                 used+=1
                 if used>=max_quotes: break
 
@@ -748,11 +871,11 @@ def build_grouped_evidence_for_prompt(
             ts=_format_ts(t0)
             q=_normalize_text(h.get("text",""))
             lines.append(f"[{label_map[vid]}] {ts}: “{q[:260]}”")
-            export.append({"video_id":vid,"label":label_map[vid],"ts":ts,"text":q,"url": _yt_ts_url(base_url, t0)})
+            export.append({"video_id":vid,"label":label_map[vid],"ts":ts,"text":q,"url": _yt_ts_url(base_url, t0), "context": _read_context_window(vid, t0)})
 
     return "\n".join(lines).strip(), {"videos": export, "label_map": label_map}
 
-# ---------- Web fetch with titles and query-aligned passages ----------
+# ---------- Web fetch with rewrites, title-gate, passage minimum ----------
 def _ddg_html(domain:str, query:str, headers:dict, timeout:float)->List[str]:
     try:
         r=requests.get("https://duckduckgo.com/html/", params={"q":f"site:{domain} {query}"}, headers=headers, timeout=timeout)
@@ -771,76 +894,90 @@ def _ddg_lite(domain:str, query:str, headers:dict, timeout:float)->List[str]:
     except Exception:
         return []
 
+def _query_rewrites(q:str)->List[str]:
+    toks = list(_expand_query_terms(q))
+    focus = " ".join(sorted(list(set([t for t in toks if len(t) > 2]))))[:120]
+    return [
+        q,
+        f"{q} clinical guidance randomized",
+        f"{q} mechanism evidence",
+        f"{focus}",
+    ]
+
 def fetch_trusted_snippets(query: str, allowed_domains: List[str],
-                           max_snippets: int = 4, per_domain: int = 2, timeout: float = 8.0):
+                           max_snippets: int = 6, per_domain: int = 2, timeout: float = 8.0):
     trace, out = [], []
     if not requests or not BeautifulSoup or max_snippets <= 0:
         st.session_state["web_trace"] = "requests/bs4 unavailable."
         return []
 
     headers = {"User-Agent": "Mozilla/5.0"}
-    qtok = set(re.findall(r"[a-z0-9]+", (query or "").lower()))
+    qtok = _expand_query_terms(query)
 
-    def best_passages(html: str, k: int = 2) -> List[str]:
-        soup = BeautifulSoup(html, "html.parser")
+    def score_title(title:str)->int:
+        t = set(re.findall(r"[a-z0-9]+", (title or "").lower()))
+        return len(t & qtok)
+
+    def best_passage(html: str) -> str | None:
+        soup = BeautifulSoup(html, "htmlparser") if False else BeautifulSoup(html, "html.parser")
         blocks = []
-        for sel in ["article", "main", "div#content", "div.content", "section", "body"]:
+        for sel in ["article","main","div#content","div.content","section","body"]:
             for node in soup.select(sel):
                 txt = _normalize_text(" ".join(p.get_text(" ", strip=True) for p in node.find_all("p")))
-                if len(txt) > 200:
-                    blocks.append(txt)
-            if blocks:
-                break
+                if len(txt) > 200: blocks.append(txt)
+            if blocks: break
         text = " ".join(blocks) if blocks else _normalize_text(soup.get_text(" ", strip=True))
-
         sents = re.split(r"(?<=[\.\?\!])\s+", text)
-        scored = []
-        for i, s in enumerate(sents):
+        best,score=None,0
+        for i,s in enumerate(sents):
             toks = set(re.findall(r"[a-z0-9]+", s.lower()))
-            overlap = len(qtok & toks)
-            if overlap == 0: 
-                continue
-            left = sents[i-1] if i-1 >=0 else ""
-            right = sents[i+1] if i+1 < len(sents) else ""
-            snippet = _normalize_text(" ".join([left, s, right]))[:500]
-            scored.append((overlap, snippet))
-        scored.sort(key=lambda x: -x[0])
-        return [sn for _, sn in scored[:k]]
+            overlap = len(toks & qtok)
+            if overlap > score:
+                left = sents[i-1] if i>0 else ""
+                right = sents[i+1] if i+1 < len(sents) else ""
+                best = _normalize_text(" ".join([left, s, right]))[:550]
+                score = overlap
+        return best if score >= 2 else None  # require at least 2-term match
 
+    queries = _query_rewrites(query)
     for domain in allowed_domains:
-        links = _ddg_html(domain, query, headers, timeout) or _ddg_lite(domain, query, headers, timeout)
-        if not links:
-            trace.append(f"{domain}: no links; homepage fallback")
-            links=[f"https://{domain}"]
-
         taken = 0
-        for url in links:
+        for q in queries:
             if taken >= per_domain or len(out) >= max_snippets:
                 break
-            try:
-                r = requests.get(url, headers=headers, timeout=timeout)
-                if r.status_code != 200:
-                    trace.append(f"{domain}: {url} status {r.status_code}")
-                    continue
-                title = ""
+            links = _ddg_html(domain, q, headers, timeout) or _ddg_lite(domain, q, headers, timeout)
+            if not links: 
+                continue
+            for url in links[:2]:
+                if taken >= per_domain or len(out) >= max_snippets:
+                    break
                 try:
+                    r = requests.get(url, headers=headers, timeout=timeout)
+                    if r.status_code != 200: 
+                        trace.append(f"{domain}: {url} {r.status_code}"); 
+                        continue
                     soup = BeautifulSoup(r.text, "html.parser")
                     title = _normalize_text(soup.title.get_text(strip=True) if soup.title else "")
-                except Exception:
-                    title = ""
-                passages = best_passages(r.text, k=1)
-                if not passages:
-                    trace.append(f"{domain}: {url} no relevant passage")
-                    continue
-                out.append({"domain": domain, "url": url, "title": title, "text": passages[0]})
-                taken += 1
-            except Exception as e:
-                trace.append(f"{domain}: fetch error {e}")
+                    passage = best_passage(r.text)
+                    if not passage: 
+                        continue
+                    if score_title(title) < 1: 
+                        continue
+                    out.append({"domain": domain, "url": url, "title": title, "text": passage})
+                    taken += 1
+                except Exception as e:
+                    trace.append(f"{domain}: fetch error {e}")
         if len(out) >= max_snippets:
             break
 
+    norm = lambda s: re.sub(r"[^a-z0-9]+"," ", (s or "").lower()).strip()
+    dedup=[]; seen=set()
+    for s in out:
+        k=(s["domain"], norm(s.get("title",""))[:80])
+        if k in seen: continue
+        seen.add(k); dedup.append(s)
     st.session_state["web_trace"] = "; ".join(trace) if trace else "no trace"
-    return out[:max_snippets]
+    return dedup[:max_snippets]
 
 # ---------- Precompute + repairs (admin only) ----------
 def _run_precompute_inline()->str:
@@ -896,18 +1033,23 @@ def _build_summaries_fallback(max_lines_per_video: int = 800) -> str:
         vids = list(texts_by_vid.keys())
         if not vids: return "no videos detected in chunks.jsonl"
 
+        # bigram-aware DF
         DF = collections.Counter()
+        def grams(t:str):
+            ws = re.findall(r"[a-z0-9]+", t.lower())
+            return set(ws) | set([" ".join(ws[i:i+2]) for i in range(len(ws)-1)])
         for vid in vids:
             seen=set()
             for t in texts_by_vid[vid]:
-                for w in set(re.findall(r"[a-z0-9]+",t.lower())):
+                for w in grams(t):
                     if w not in seen:
                         DF[w]+=1; seen.add(w)
         N = max(1,len(vids))
         def score_line(t:str)->float:
-            words=re.findall(r"[a-z0-9]+",t.lower())
-            tf=collections.Counter(words)
-            return sum(tf[w]*math.log((N+1)/(DF.get(w,1)+0.5)) for w in tf)/(len(words)+1e-6)
+            ws = re.findall(r"[a-z0-9]+", t.lower())
+            bg = [" ".join(ws[i:i+2]) for i in range(len(ws)-1)]
+            tf = collections.Counter(ws + bg)
+            return sum(tf[w]*math.log((N+1)/(DF.get(w,1)+0.5)) for w in tf)/(len(ws)+1e-6)
 
         summaries={}
         for vid in vids:
@@ -995,7 +1137,7 @@ def _get_or_set_uid() -> str:
     if EncryptedCookieManager is not None:
         cookies = EncryptedCookieManager(prefix="hnq_", password=os.getenv("COOKIE_SECRET","set-a-strong-secret"))
         if not cookies.ready():
-            st.stop()  # initialize cookies then rerun
+            st.stop()
         uid = cookies.get("uid")
         if not uid:
             uid = str(uuid.uuid4())
@@ -1051,7 +1193,7 @@ st.set_page_config(page_title="Health | Nutrition Q&A", page_icon="🍎", layout
 st.title("Health | Nutrition Q&A")
 
 # Init unique users DB and register visitor
-_init_users_db()
+(_init_users_db(),)
 uid = _get_or_set_uid()
 _register_unique(uid)
 
@@ -1084,7 +1226,7 @@ with st.sidebar:
     for i,dom in enumerate(TRUSTED_DOMAINS):
         if st.checkbox(dom, value=True, key=f"site_{i}"):
             selected_domains.append(dom)
-    max_web_auto = 4
+    max_web_auto = 6
 
     model_choice = st.selectbox(
         "Answering model",
@@ -1093,15 +1235,15 @@ with st.sidebar:
     )
 
     with st.expander("Advanced (technical controls)", expanded=False):
-        # Higher recall defaults
-        st.number_input("Scan candidates first (K)", 128, 8000, 1536, 64, key="adv_scanK")
-        st.number_input("Use top passages", 8, 300, 72, 2, key="adv_useK")
-        st.number_input("Max videos", 3, 30, 12, 1, key="adv_maxvid")
-        st.number_input("Passages per video cap", 1, 10, 5, 1, key="adv_cap")
+        st.number_input("Scan candidates first (K)", 128, 8000, 3000, 64, key="adv_scanK")
+        st.number_input("Use top passages", 8, 300, 120, 2, key="adv_useK")
+        st.number_input("Max videos", 3, 30, 16, 1, key="adv_maxvid")
+        st.number_input("Passages per video cap", 1, 10, 6, 1, key="adv_cap")
         st.checkbox("Diversify with MMR", value=True, key="adv_mmr")
         st.slider("MMR balance", 0.1, 0.9, 0.35, 0.05, key="adv_lam")
         st.slider("Recency weight", 0.0, 1.0, 0.15, 0.05, key="adv_rec")
         st.slider("Recency half-life (days)", 7, 720, 365, 7, key="adv_hl")
+        st.slider("Creator prior gain", 0.8, 1.5, 1.0, 0.05, key="_prior_gain")
 
     st.divider()
     show_diag = st.toggle("Show data diagnostics", value=False)
@@ -1237,12 +1379,16 @@ st.session_state["_last_qv"] = qv
 
 domain_top = classify_query_domains(domain_model, prompt, top_k=3, min_keep=1)
 
+# topic hint + creator prior gain
+st.session_state["_topic_hint"] = infer_topic(prompt, domain_top)
+st.session_state["_vid_to_creator_cache"] = vid_to_creator
+
 def _domain_score(vid: str) -> float:
     if not domain_top or not per_video_domain_probs.get(vid): return 0.0
     dv = per_video_domain_probs[vid]
     return float(sum(dv.get(d, 0.0) for d in domain_top) / max(1, len(domain_top)))
 
-# Higher recall routing defaults
+# Routing defaults
 topK_route = 24
 recency_weight_auto = 0.15
 half_life_auto = 365
@@ -1263,11 +1409,11 @@ if not routed_vids and domain_top and per_video_domain_probs and allowed_for_rou
 
 candidate_vids = set(routed_vids) if routed_vids else allowed_vids_all
 
-K_scan = st.session_state.get("adv_scanK", 1536)
-K_use  = st.session_state.get("adv_useK", 72)
+K_scan = st.session_state.get("adv_scanK", 3000)
+K_use  = st.session_state.get("adv_useK", 120)
 min_distinct_videos = 3
-max_videos = max(int(st.session_state.get("adv_maxvid", 12)), min_distinct_videos)
-per_video_cap = max(int(st.session_state.get("adv_cap", 5)), 2)
+max_videos = max(int(st.session_state.get("adv_maxvid", 16)), min_distinct_videos)
+per_video_cap = max(int(st.session_state.get("adv_cap", 6)), 2)
 use_mmr = st.session_state.get("adv_mmr", True)
 mmr_lambda = st.session_state.get("adv_lam", 0.35)
 recency_weight = st.session_state.get("adv_rec", recency_weight_auto)
@@ -1286,8 +1432,8 @@ with st.spinner("Scanning selected videos…"):
         with st.chat_message("assistant"):
             st.error("Search failed."); st.exception(e); st.stop()
 
-# Merge in Stage A keyword booster
-kw_hits = stageA_keyword_boost(prompt, candidate_vids, max_lines=2500, top_per_video=2)
+# Merge in Stage A BM25 booster
+kw_hits = stageA_keyword_boost(prompt, candidate_vids, max_scan=4000, top_per_video=3)
 if kw_hits:
     seen = set()
     all_hits = kw_hits + hits
@@ -1338,6 +1484,11 @@ with st.chat_message("assistant"):
             st.button("Clear chat", key="clear_nohits", on_click=_clear_chat)
         st.stop()
 
+    # conflict surfacing
+    conflicts = _detect_conflicts(export_struct["videos"])
+    if conflicts:
+        st.info("Conflicts detected: " + ", ".join([f"{k} ({msg})" for k,msg in conflicts]))
+
     with st.spinner("Writing your answer…"):
         gen = stream_openai_answer(model_choice, prompt, st.session_state["messages"],
                                    grouped_block, web_snips, no_video=(len(export_struct["videos"])==0))
@@ -1354,16 +1505,17 @@ with st.chat_message("assistant"):
         "web_trace": st.session_state.get("web_trace","")
     }
     st.session_state["turns"].append(this_turn)
-    _save_turn_snapshot(this_turn)
+    try: SESSION_SNAP.write_text(json.dumps(this_turn, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception: pass
 
-    # Small telemetry line about evidence coverage
+    # Telemetry
     try:
         vids_considered = len(set([(h.get('meta') or {}).get('video_id') for h in hits]))
     except Exception:
         vids_considered = 0
     st.caption(f"Videos considered: {vids_considered} · Passages used: {len(export_struct['videos'])} · Web excerpts: {len(web_snips)}")
 
-    # Sources for this reply — tabs
+    # Sources tabs
     st.markdown("---")
     tabs = st.tabs(["Video quotes", "Trusted websites", "Web fetch trace"])
 
