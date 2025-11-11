@@ -16,8 +16,8 @@ Quality upgrades in this revision:
 - Optional cross-encoder re-ranking (if available).
 - Trusted websites return query-aligned sentence passages with links and titles.
 - Stricter system prompt for concrete, per-claim-cited answers.
-
-DATA_DIR must contain data/{chunks,index,catalog,domain}. OPENAI_API_KEY must be set.
+- Topic→expert weighting and improved keyword expansion.
+- Structured outputs: Summary → To-Dos → Notes.
 """
 
 from __future__ import annotations
@@ -99,7 +99,9 @@ USERS_DB = DATA_ROOT / "users.sqlite"
 TRUSTED_DOMAINS = [
     "nih.gov","medlineplus.gov","cdc.gov","mayoclinic.org","health.harvard.edu",
     "familydoctor.org","healthfinder.gov","ama-assn.org","medicalxpress.com",
-    "sciencedaily.com","nejm.org","med.stanford.edu","icahn.mssm.edu"
+    "sciencedaily.com","nejm.org","med.stanford.edu","icahn.mssm.edu",
+    "uptodate.com","aacp.org","ahajournals.org","acc.org","escardio.org",
+    "bmj.com","thelancet.com","cochranelibrary.com","who.int","ncbi.nlm.nih.gov",
 ]
 
 ALLOWED_CREATORS = [
@@ -114,9 +116,78 @@ EXCLUDED_CREATORS_EXACT = {
     "dr. pradip jamnadas, md and the primal podcast",
 }
 
+# ---------- Topic → creator weights ----------
+# Higher weight = stronger preference in routing and ranking.
+CREATOR_WEIGHT_DEFAULT = {
+    "Peter Attia MD": 0.6,
+    "Andrew Huberman": 0.4,
+    "Healthy Immune Doc": 0.3,
+    "Dr. Pradip Jamnadas, MD": 0.3,
+    "The Diary of A CEO": 0.1,
+}
+
+TOPIC_WEIGHT_PROFILES = {
+    # Longevity questions
+    "longevity": {
+        "Peter Attia MD": 1.0,
+        "Andrew Huberman": 0.7,
+        "Healthy Immune Doc": 0.5,
+        "Dr. Pradip Jamnadas, MD": 0.4,
+        "The Diary of A CEO": 0.2,
+    },
+    # Food, nutrition, supplements
+    "nutrition": {
+        "Healthy Immune Doc": 1.0,
+        "Andrew Huberman": 0.8,
+        "Peter Attia MD": 0.6,
+        "Dr. Pradip Jamnadas, MD": 0.4,
+        "The Diary of A CEO": 0.2,
+    },
+    # Heart / cardiac health
+    "cardiac": {
+        "Peter Attia MD": 1.0,
+        "Dr. Pradip Jamnadas, MD": 0.9,
+        "Andrew Huberman": 0.6,
+        "The Diary of A CEO": 0.2,
+        "Healthy Immune Doc": 0.2,
+    },
+}
+
+TOPIC_KEYWORDS = {
+    "longevity": [
+        "longevity","lifespan","healthspan","aging","rapamycin","metformin","zone 2",
+        "vo2 max","apoe","dexascan","epigenetic","clock","senolytic","sleep architecture",
+    ],
+    "nutrition": [
+        "diet","nutrition","protein","fiber","glycemic","glucose","insulin","supplement",
+        "omega-3","creatine","magnesium","electrolyte","polyphenol","fasting","feeding window",
+        "meal timing","breakfast","caffeine","coffee","tea","probiotic","prebiotic",
+    ],
+    "cardiac": [
+        "heart","cardiac","coronary","ldl","apob","triglyceride","statin","ezetimibe",
+        "pcsk9","lp(a)","cabg","stent","angina","calcification","calcium score",
+        "hypertension","bp","blood pressure","arrhythmia","afib","vo2","cardio","aerobic",
+    ],
+}
+
+def _detect_topic(query: str) -> str:
+    q = (query or "").lower()
+    for topic, keys in TOPIC_KEYWORDS.items():
+        if any(k in q for k in keys):
+            return topic
+    return "longevity"  # default bias
+
+def _creator_weight_for_query(query: str) -> dict:
+    topic = _detect_topic(query)
+    base = CREATOR_WEIGHT_DEFAULT.copy()
+    prof = TOPIC_WEIGHT_PROFILES.get(topic, {})
+    for k, v in prof.items():
+        base[k] = max(base.get(k, 0.0), float(v))
+    return base  # creator -> weight in [0..1]
+
 # ---------- Small utils ----------
 def _normalize_text(s:str)->str:
-    return re.sub(r"\s+"," ",(s or "").strip())
+    return re.sub(r"\\s+"," ",(s or "").strip())
 
 def _parse_ts(v)->float:
     if isinstance(v,(int,float)):
@@ -270,26 +341,27 @@ def stream_openai_answer(model_name: str, question: str, history, grouped_video_
     system = (
         "Answer ONLY from the evidence below. Do not invent sources.\n"
         "Citations:\n"
-        "• Videos: [V1], [V2], ... Optionally add @mm:ss, e.g., [V2@09:06].\n"
+        "• Videos: [V1], [V2], ... with optional @mm:ss, e.g., [V2@09:06].\n"
         "• Web: (W1), (W2), ...\n"
-        "Rules for content quality:\n"
-        "1) Be specific. Prefer concrete protocols (dosage ranges, timing, frequency) when present in evidence.\n"
-        "2) If a claim is not in evidence, do NOT include it.\n"
-        "3) Tie each non-obvious sentence to a citation immediately at the end.\n"
-        "4) If video evidence conflicts, surface the conflict in one bullet with both citations.\n"
-        "5) If videos are weak but web is strong, start with 'Web-supported answer'. If no videos, start with 'Web-only evidence'.\n"
-        "6) No generic advice. Only what evidence supports.\n"
-        "Output structure:\n"
-        "• Key Findings (3–6 bullets)\n"
-        "• Practical Protocol (ordered steps)\n"
-        "• Gaps / What to Validate (unknowns, thresholds, tests)\n"
+        "Quality rules:\n"
+        "1) Be specific. Prefer concrete protocols (dose, timing, frequency) if present in evidence.\n"
+        "2) Each non-obvious sentence must end with a citation tag.\n"
+        "3) If sources conflict, show one bullet summarizing the disagreement with both citations.\n"
+        "4) If videos are weak but web is strong, begin with 'Web-supported answer'. If no videos, begin with 'Web-only evidence'.\n"
+        "Output sections and order (keep titles exactly):\n"
+        "Summary:\n"
+        "- 3–6 bullets of the main conclusions, each with citations.\n"
+        "To-Dos:\n"
+        "- Ordered, actionable steps the user can take next, each with citations when derived from evidence.\n"
+        "Notes:\n"
+        "- Gaps, thresholds to check, tests to consider, or what to validate with a clinician, each with citations.\n"
     ) + fallback_line
 
     user_payload = (("Recent conversation:\n"+"\n".join(convo)+"\n\n") if convo else "") + \
                    f"Question: {question}\n\n" + \
                    "Video Evidence (labeled):\n" + (grouped_video_block or "None") + "\n\n" + \
                    "Trusted Web Snippets:\n" + web_block + "\n\n" + \
-                   "Return succinct bullets with per-claim citations, and avoid generic safety language unless directly supported."
+                   "Return succinct bullets with per-claim citations; avoid generic safety language unless directly supported."
 
     client = OpenAI(timeout=60)
     try:
@@ -562,6 +634,12 @@ def route_videos_by_summary(
         cs = cent.get(v, 0.0)
         rec = _recency_score(_vid_epoch(vm, v), now, half_life_days)
         base = 0.6*cs + 0.3*kw
+
+        # Prefer creators per topic
+        creator = _canonicalize_creator(_raw_creator_of_vid(v, vm))
+        cw = st.session_state.get("_creator_weights", CREATOR_WEIGHT_DEFAULT).get(creator or "", 0.0)
+        base = base * (1.0 + 0.25 * cw)  # 25% boost scaled by weight
+
         score = (1.0 - recency_weight)*base + recency_weight*(0.1*rec + 0.9*base)
         scored.append((v, score))
     scored.sort(key=lambda x:-x[1])
@@ -572,6 +650,23 @@ def stageA_keyword_boost(query: str, allowed_vids: Set[str] | None, max_lines: i
     if not CHUNKS_PATH.exists(): 
         return []
     qtok = set(re.findall(r"[a-z0-9]+", (query or "").lower()))
+
+    # Lightweight expansion to improve recall
+    EXPAND = {
+        "ldl": ["ldl","apo b","apob","non-hdl","cholesterol","atherogenic"],
+        "bp": ["bp","blood pressure","hypertension","map","systolic","diastolic"],
+        "glucose": ["glucose","glycemia","glycemic","insulin","hba1c","postprandial","cgms","continuous glucose"],
+        "exercise": ["zone","vo2","aerobic","cardio","resistance","strength","reps","sets","hypertrophy"],
+        "supplement": ["supplement","magnesium","creatine","omega","epa","dha","fish oil","electrolyte","vitamin","polyphenol"],
+        "fast": ["fast","intermittent","time-restricted","feeding window","if","tre"],
+        "cardiac": ["cabg","stent","angiogram","calcium","score","ct","plaque","statin","pcsk9","ezetimibe","niacin"],
+        "sleep": ["sleep","slow wave","rem","architecture","insomnia","melatonin","caffeine","chronotype"],
+    }
+    qlow = (query or "").lower()
+    for terms in EXPAND.values():
+        if any(t in qlow for t in terms):
+            qtok.update([re.sub(r"[^a-z0-9]","", t.lower()) for t in terms])
+
     kept = []
     offs = _ensure_offsets()
     step = max(1, len(offs) // max_lines)
@@ -595,7 +690,7 @@ def stageA_keyword_boost(query: str, allowed_vids: Set[str] | None, max_lines: i
                 continue
             toks = set(re.findall(r"[a-z0-9]+", t.lower()))
             overlap = len(qtok & toks)
-            if overlap < 3:
+            if overlap < 2:
                 continue
             start = _parse_ts(m.get("start", m.get("start_sec", 0)))
             kept.append({"score": overlap, "text": t, "meta": {"video_id": vid, "start": start}})
@@ -655,6 +750,12 @@ def stageB_search_chunks(query:str,
         m=metas[li]; t=texts[li]; vid=m.get("video_id")
         rec=_recency_score(_vid_epoch(vm,vid), now, half_life_days)
         score=(1.0-recency_weight)*float(base)+recency_weight*float(rec)
+
+        # Creator bias
+        creator = _canonicalize_creator(_raw_creator_of_vid(m.get("video_id",""), vm))
+        cw = st.session_state.get("_creator_weights", CREATOR_WEIGHT_DEFAULT).get(creator or "", 0.0)
+        score = score * (1.0 + 0.25 * cw)
+
         blended.append((i_global,score,t,m))
     blended.sort(key=lambda x:-x[1])
 
@@ -688,7 +789,7 @@ def _first_bullets(vid:str, summaries:dict, k:int=2)->List[dict]:
 
 def build_grouped_evidence_for_prompt(
     hits: List[Dict[str,Any]], vm:dict, summaries:dict,
-    routed_vids: List[str], max_quotes:int=3,
+    routed_vids: List[str], max_quotes:int=4,
     qv: np.ndarray | None = None, embedder: SentenceTransformer | None = None
 ) -> Tuple[str, Dict[str, Any]]:
     groups = group_hits_by_video(hits)
@@ -729,8 +830,8 @@ def build_grouped_evidence_for_prompt(
             export.append({"video_id":vid,"label":label_map[vid],"ts":ts,"text":q,"url": _yt_ts_url(base_url, t0)})
             used+=1
 
-        if used < 2:
-            need = min(2 - used, max(0, max_quotes - used))
+        if used < 3:
+            need = min(3 - used, max(0, max_quotes - used))
             for b in _first_bullets(vid, summaries or {}, k=need):
                 ts_txt = b["ts"]
                 try_sec = 0.0
@@ -772,7 +873,7 @@ def _ddg_lite(domain:str, query:str, headers:dict, timeout:float)->List[str]:
         return []
 
 def fetch_trusted_snippets(query: str, allowed_domains: List[str],
-                           max_snippets: int = 4, per_domain: int = 2, timeout: float = 8.0):
+                           max_snippets: int = 6, per_domain: int = 1, timeout: float = 8.0):
     trace, out = [], []
     if not requests or not BeautifulSoup or max_snippets <= 0:
         st.session_state["web_trace"] = "requests/bs4 unavailable."
@@ -798,7 +899,7 @@ def fetch_trusted_snippets(query: str, allowed_domains: List[str],
         for i, s in enumerate(sents):
             toks = set(re.findall(r"[a-z0-9]+", s.lower()))
             overlap = len(qtok & toks)
-            if overlap == 0: 
+            if overlap < 2:
                 continue
             left = sents[i-1] if i-1 >=0 else ""
             right = sents[i+1] if i+1 < len(sents) else ""
@@ -1084,7 +1185,7 @@ with st.sidebar:
     for i,dom in enumerate(TRUSTED_DOMAINS):
         if st.checkbox(dom, value=True, key=f"site_{i}"):
             selected_domains.append(dom)
-    max_web_auto = 4
+    max_web_auto = 6
 
     model_choice = st.selectbox(
         "Answering model",
@@ -1202,6 +1303,9 @@ if prompt is None:
     with cols[-1]:
         st.button("Clear chat", key="clear_idle", on_click=_clear_chat)
     st.stop()
+
+# Initialize creator weights for this turn
+st.session_state["_creator_weights"] = _creator_weight_for_query(prompt)
 
 st.session_state["messages"].append({"role":"user","content":prompt})
 with st.chat_message("user"): st.markdown(prompt)
@@ -1326,7 +1430,7 @@ if allow_web and requests and BeautifulSoup and int(max_web_auto)>0:
                 if len(web_snips)>=2: break
 
 grouped_block, export_struct = build_grouped_evidence_for_prompt(
-    hits, vm, summaries, routed_vids=routed_vids, max_quotes=3, qv=qv, embedder=embedder
+    hits, vm, summaries, routed_vids=routed_vids, max_quotes=4, qv=qv, embedder=embedder
 )
 
 with st.chat_message("assistant"):
