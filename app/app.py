@@ -187,7 +187,8 @@ def _creator_weight_for_query(query: str) -> dict:
 
 # ---------- Small utils ----------
 def _normalize_text(s:str)->str:
-    return re.sub(r"\\s+"," ",(s or "").strip())
+    # Correct whitespace normalization (was r"\\s+" before)
+    return re.sub(r"\s+"," ",(s or "").strip())
 
 def _parse_ts(v)->float:
     if isinstance(v,(int,float)):
@@ -334,41 +335,62 @@ def stream_openai_answer(model_name: str, question: str, history, grouped_video_
     ]
     web_block = "\n".join(web_lines) if web_lines else "None"
 
-    fallback_line = ("If no suitable video evidence exists, answer from trusted web snippets alone and begin with 'Web-only evidence'.\n"
-                     if (WEB_FALLBACK and no_video) else
-                     "Trusted web snippets are supporting evidence.\n")
+    has_video = not no_video
+
+    if has_video:
+        fallback_line = (
+            "There IS usable video evidence.\n"
+            "- Treat video quotes ([V1], [V2@mm:ss]) as the PRIMARY source of truth.\n"
+            "- Use web snippets ((W1), (W2)) only to refine, cross-check, or fill small gaps.\n"
+            "- If web and video disagree, prefer the videos in practical recommendations and explicitly note the disagreement.\n"
+        )
+    else:
+        fallback_line = (
+            "There is NO video evidence.\n"
+            "- You MUST answer only from web snippets.\n"
+            "- Begin the answer with the phrase 'Web-only evidence'.\n"
+        )
 
     system = (
-        "Answer ONLY from the evidence below. Do not invent sources.\n"
-        "Citations:\n"
-        "• Videos: [V1], [V2], ... with optional @mm:ss, e.g., [V2@09:06].\n"
-        "• Web: (W1), (W2), ...\n"
-        "Quality rules:\n"
-        "1) Be specific. Prefer concrete protocols (dose, timing, frequency) if present in evidence.\n"
-        "2) Each non-obvious sentence must end with a citation tag.\n"
-        "3) If sources conflict, show one bullet summarizing the disagreement with both citations.\n"
-        "4) If videos are weak but web is strong, begin with 'Web-supported answer'. If no videos, begin with 'Web-only evidence'.\n"
-        "Output sections and order (keep titles exactly):\n"
+        "You are a retrieval-augmented assistant whose job is to answer from the supplied evidence, "
+        "not from your general training.\n"
+        "Evidence types:\n"
+        "- Videos: labeled [V1], [V2], etc. with timestamps like [V2@09:06].\n"
+        "- Web snippets: labeled (W1), (W2), etc.\n"
+        + fallback_line +
+        "Citation rules:\n"
+        "1) When video evidence exists, every non-obvious claim must end with at least one [V#] citation. "
+        "Add web citations ((W#)) only as secondary support.\n"
+        "2) If multiple videos support a point, you may cite more than one, e.g., [V1@03:12][V3@10:45].\n"
+        "3) If web snippets disagree with videos, describe the disagreement in 'Notes:' with both tags, "
+        "and default to the video evidence for practical To-Dos.\n"
+        "Output format (titles exactly as below):\n"
         "Summary:\n"
-        "- 3–6 bullets of the main conclusions, each with citations.\n"
+        "- 3–6 bullets of the main conclusions with citations.\n"
         "To-Dos:\n"
-        "- Ordered, actionable steps the user can take next, each with citations when derived from evidence.\n"
+        "- Ordered, concrete steps (dose, timing, frequency when available) with citations.\n"
         "Notes:\n"
-        "- Gaps, thresholds to check, tests to consider, or what to validate with a clinician, each with citations.\n"
-    ) + fallback_line
+        "- Uncertainties, caveats, thresholds to check, or what to discuss with a clinician, with citations.\n"
+    )
 
     user_payload = (("Recent conversation:\n"+"\n".join(convo)+"\n\n") if convo else "") + \
                    f"Question: {question}\n\n" + \
                    "Video Evidence (labeled):\n" + (grouped_video_block or "None") + "\n\n" + \
                    "Trusted Web Snippets:\n" + web_block + "\n\n" + \
-                   "Return succinct bullets with per-claim citations; avoid generic safety language unless directly supported."
+                   "Return succinct bullets with per-claim citations; avoid generic, unsupported safety language."
 
-    client = OpenAI(timeout=60)
+    # Updated client usage: no timeout on client; per-request timeout on create()
+    client = OpenAI()
     try:
         stream = client.chat.completions.create(
-            model=model_name, temperature=0.2, stream=True,
-            messages=[{"role":"system","content":system},
-                      {"role":"user","content":user_payload}]
+            model=model_name,
+            temperature=0.2,
+            stream=True,
+            timeout=60,
+            messages=[
+                {"role":"system","content":system},
+                {"role":"user","content":user_payload},
+            ]
         )
     except Exception as e:
         yield f"⚠️ Generation failed: {e}"
@@ -577,8 +599,14 @@ def _dedupe_passages(items:List[Dict[str,Any]], time_window_sec:float=8.0, min_c
         seen.append(h); out.append(h)
     return out
 
-def _quote_relevance_ok(query:str, quote:str, qv:np.ndarray, embedder:SentenceTransformer,
-                        min_overlap:int=3, min_cos:float=0.35)->bool:
+def _quote_relevance_ok(
+    query:str,
+    quote:str,
+    qv:np.ndarray,
+    embedder:SentenceTransformer,
+    min_overlap:int=2,
+    min_cos:float=0.25
+)->bool:
     if _kw_overlap(query, quote) < min_overlap:
         return False
     try:
@@ -586,6 +614,7 @@ def _quote_relevance_ok(query:str, quote:str, qv:np.ndarray, embedder:SentenceTr
         cos = float(np.dot(qv, t_vec))
         return cos >= min_cos
     except Exception:
+        # If embedding fails, prefer recall and let earlier routing do filtering
         return True
 
 # ---------- Summary-aware routing ----------
@@ -816,9 +845,13 @@ def build_grouped_evidence_for_prompt(
         if qv is not None and embedder is not None:
             for h in clean:
                 q = _normalize_text(h.get("text",""))
-                if _quote_relevance_ok(query_txt, q, qv, embedder, min_overlap=3, min_cos=0.35):
+                if _quote_relevance_ok(query_txt, q, qv, embedder, min_overlap=2, min_cos=0.25):
                     kept.append(h)
         else:
+            kept = clean
+
+        # If the filter was too strict, fall back to the deduped set
+        if not kept:
             kept = clean
 
         used=0
@@ -1332,8 +1365,16 @@ domain_model, per_video_domain_probs, domain_set = load_domain_model()
 
 vid_to_creator, creator_to_vids = build_creator_indexes_from_chunks(vm)
 universe = set(vid_list or list(vm.keys()) or list(vid_to_creator.keys()))
+
 chosen = st.session_state.get("selected_creators", set(ALLOWED_CREATORS))
+# If user unchecks everything, treat as "all experts"
+if not chosen:
+    chosen = set(ALLOWED_CREATORS)
+
 allowed_vids_all = {vid for vid in universe if vid_to_creator.get(vid) in chosen}
+# If mapping/metadata too weak, fall back to all videos
+if not allowed_vids_all:
+    allowed_vids_all = universe
 
 qv = embedder.encode([prompt], normalize_embeddings=True).astype("float32")[0]
 st.session_state["_last_query"] = prompt
@@ -1366,6 +1407,9 @@ if not routed_vids and domain_top and per_video_domain_probs and allowed_for_rou
     routed_vids = alt
 
 candidate_vids = set(routed_vids) if routed_vids else allowed_vids_all
+# Safety: never allow an empty candidate set
+if not candidate_vids:
+    candidate_vids = universe
 
 K_scan = st.session_state.get("adv_scanK", 1536)
 K_use  = st.session_state.get("adv_useK", 72)
@@ -1412,7 +1456,7 @@ if ce and hits:
     pairs = [(prompt, _normalize_text(h["text"])) for h in hits]
     scores = ce.predict(pairs)
     for h, s in zip(hits, scores):
-        h["score"] = float(h.get("score",0.0)) + float(s)
+        h["score"] = float(s)
     hits.sort(key=lambda r: -float(r.get("score",0.0)))
 
 web_snips=[]
@@ -1443,8 +1487,14 @@ with st.chat_message("assistant"):
         st.stop()
 
     with st.spinner("Writing your answer…"):
-        gen = stream_openai_answer(model_choice, prompt, st.session_state["messages"],
-                                   grouped_block, web_snips, no_video=(len(export_struct["videos"])==0))
+        gen = stream_openai_answer(
+            model_choice,
+            prompt,
+            st.session_state["messages"],
+            grouped_block,
+            web_snips,
+            no_video=(len(export_struct["videos"])==0)
+        )
         ans = st.write_stream(gen)
 
     st.session_state["messages"].append({"role":"assistant","content":ans})
@@ -1460,14 +1510,12 @@ with st.chat_message("assistant"):
     st.session_state["turns"].append(this_turn)
     _save_turn_snapshot(this_turn)
 
-    # Small telemetry line about evidence coverage
     try:
         vids_considered = len(set([(h.get('meta') or {}).get('video_id') for h in hits]))
     except Exception:
         vids_considered = 0
     st.caption(f"Videos considered: {vids_considered} · Passages used: {len(export_struct['videos'])} · Web excerpts: {len(web_snips)}")
 
-    # Sources for this reply — tabs
     st.markdown("---")
     tabs = st.tabs(["Video quotes", "Trusted websites", "Web fetch trace"])
 
