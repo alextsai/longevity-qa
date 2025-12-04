@@ -1,252 +1,369 @@
 # scripts/precompute_video_summaries.py
-# Build high-quality, extractive per-video bullets + centroids.
-#
-# Outputs:
-#   /var/data/data/index/video_centroids.npy      (float32 [V, d], unit-norm)
-#   /var/data/data/index/video_ids.txt            (one video_id per line)
-#   /var/data/data/catalog/video_summaries.json   ({
-#       vid:{
-#         title, channel, published_at,
-#         bullets:[{ts, text, chunk_idx, span}],
-#         key_terms:[...],
-#         metrics:{coverage, redundancy, n_bullets}
-#       }
-#   })
-#
-# Run:
-#   DATA_DIR=/var/data python scripts/precompute_video_summaries.py
+# -*- coding: utf-8 -*-
+"""
+Precompute video summaries for Health | Nutrition Q&A.
 
-import os, json, math, pickle, re
+Reads:
+- DATA_DIR (env) or defaults to /var/data
+- DATA_DIR/data/chunks/chunks.jsonl
+- DATA_DIR/data/catalog/video_meta.json (optional)
+
+Writes:
+- DATA_DIR/data/catalog/video_summaries.json
+
+Design:
+- Topic-aware, multi-section summarization per video using rule-based
+  keyword buckets (no LLM call needed).
+- Each video gets:
+    {
+        "title": ...,
+        "channel": ...,
+        "published_at": ...,
+        "tags": [...],                # high-level topics present
+        "sections": [                 # topic sections
+            {
+                "id": "lipids_cardio",
+                "topic": "Lipids & Cardiometabolic",
+                "bullets": [
+                    {"ts": 123.0, "text": "..."},
+                    ...
+                ],
+            },
+            ...
+        ],
+        "bullets": [                  # flattened, general bullets (for app.py)
+            {"ts": 45.0, "text": "..."},
+            ...
+        ],
+        "summary": "Short multi-topic summary string..."
+    }
+
+The existing app.py only *requires* `bullets` and `summary`, so it remains
+fully backward-compatible. The richer sections can be used later.
+"""
+
+from __future__ import annotations
+
+import os
+import json
+import re
 from pathlib import Path
-from collections import defaultdict, Counter
+from typing import Dict, List, Any
 
-import numpy as np
-from sentence_transformers import SentenceTransformer
+# ---------- Paths ----------
 
+ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = Path(os.getenv("DATA_DIR", "/var/data")).resolve()
-CHUNKS = DATA_ROOT / "data/chunks/chunks.jsonl"
-VIDEO_META = DATA_ROOT / "data/catalog/video_meta.json"
-OUT_CENT = DATA_ROOT / "data/index/video_centroids.npy"
-OUT_IDS  = DATA_ROOT / "data/index/video_ids.txt"
-OUT_SUM  = DATA_ROOT / "data/catalog/video_summaries.json"
-METAS_PKL= DATA_ROOT / "data/index/metas.pkl"
+DATA_DIR = DATA_ROOT / "data"
 
-SENT_SPLIT = re.compile(r'(?<=[\.\!\?])\s+')
+CHUNKS_PATH     = DATA_DIR / "chunks" / "chunks.jsonl"
+VIDEO_META_JSON = DATA_DIR / "catalog" / "video_meta.json"
+VID_SUM_JSON    = DATA_DIR / "catalog" / "video_summaries.json"
 
-def _parse_ts(v):
-    if isinstance(v,(int,float)): return float(v)
-    try:
-        sec=0.0
-        for p in str(v).split(":"):
-            sec=sec*60+float(p)
-        return sec
-    except: return 0.0
+# ---------- Basic utils ----------
 
-def normalize(s): 
-    return " ".join((s or "").split())
+def _normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
-def sent_tokenize(text: str):
-    text = normalize(text)
-    if not text: return []
-    parts = SENT_SPLIT.split(text)
-    return [p.strip() for p in parts if len(p.strip()) >= 20]
-
-def _jaccard(a: set, b: set) -> float:
-    if not a or not b: return 0.0
-    return len(a & b) / max(1, len(a | b))
-
-def main():
-    assert CHUNKS.exists(), f"missing {CHUNKS}"
-    vm = {}
-    if VIDEO_META.exists():
-        try: vm = json.loads(VIDEO_META.read_text(encoding="utf-8"))
-        except: vm = {}
-
-    # align encoder with FAISS model
-    model_name = "sentence-transformers/all-MiniLM-L6-v2"
-    if METAS_PKL.exists():
+def _parse_ts(v) -> float:
+    if isinstance(v, (int, float)):
         try:
-            with METAS_PKL.open("rb") as f:
-                payload=pickle.load(f)
-            model_name = payload.get("model", model_name)
-        except: pass
+            return float(v)
+        except Exception:
+            return 0.0
+    try:
+        sec = 0.0
+        for p in str(v).split(":"):
+            sec = sec * 60 + float(p)
+        return sec
+    except Exception:
+        return 0.0
 
-    local_dir = DATA_ROOT / "models" / "all-MiniLM-L6-v2"
-    try_name = str(local_dir) if (local_dir/"config.json").exists() else model_name
-    enc = SentenceTransformer(try_name, device="cpu")
+def _truncate(txt: str, limit: int = 280) -> str:
+    txt = _normalize_text(txt)
+    if len(txt) <= limit:
+        return txt
+    return txt[:limit].rsplit(" ", 1)[0] + "…"
 
-    # 1) load chunks grouped by video
-    texts_by_vid = defaultdict(list)
-    metas_by_vid = defaultdict(list)
-    with CHUNKS.open(encoding="utf-8") as f:
+def _load_video_meta() -> Dict[str, Dict[str, Any]]:
+    if VIDEO_META_JSON.exists():
+        try:
+            return json.loads(VIDEO_META_JSON.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+# ---------- Topic buckets ----------
+
+TOPIC_SPEC = {
+    "lipids_cardio": {
+        "label": "Lipids & Cardiometabolic",
+        "keywords": [
+            "ldl", "apo b", "apob", "apolipoprotein b", "non-hdl",
+            "triglyceride", "triglycerides", "cholesterol", "lipid", "lipids",
+            "statin", "statins", "ezetimibe", "pcsk9", "inclisiran",
+            "plaque", "atherosclerosis", "coronary", "cac", "calcium score",
+            "lp(a)", "lipoprotein(a)", "coronary artery", "cardiovascular",
+        ],
+        "max_bullets": 5,
+    },
+    "exercise_training": {
+        "label": "Exercise & Training",
+        "keywords": [
+            "exercise", "training", "resistance training", "strength training",
+            "hypertrophy", "reps", "sets", "weightlifting", "lifting",
+            "zone 2", "zone two", "vo2", "vo2 max", "aerobic", "anaerobic",
+            "cardio", "conditioning", "endurance", "sprinting", "hiit",
+        ],
+        "max_bullets": 5,
+    },
+    "sleep_circadian": {
+        "label": "Sleep & Circadian",
+        "keywords": [
+            "sleep", "deep sleep", "slow wave", "rem sleep", "rem",
+            "circadian", "circadian rhythm", "chronotype", "insomnia",
+            "sleep latency", "sleep hygiene", "sleep quality", "sleep duration",
+            "melatonin", "sunlight", "morning light", "blue light",
+        ],
+        "max_bullets": 4,
+    },
+    "nutrition_fasting": {
+        "label": "Nutrition & Fasting",
+        "keywords": [
+            "diet", "nutrition", "macronutrient", "protein", "carbohydrate",
+            "carb", "fat", "fiber", "glycemic", "glucose", "fructose",
+            "sugar", "refined", "processed food", "ultra-processed",
+            "fasting", "time-restricted", "time restricted", "intermittent",
+            "keto", "ketogenic", "low carb", "mediterranean",
+        ],
+        "max_bullets": 5,
+    },
+    "supplements_meds": {
+        "label": "Supplements & Medications",
+        "keywords": [
+            "supplement", "supplements", "vitamin", "magnesium", "omega 3",
+            "fish oil", "epa", "dha", "creatine", "berberine", "metformin",
+            "rapamycin", "statin", "statins", "niacin", "coq10", "coenzyme q10",
+            "glp-1", "semaglutide", "tirzepatide", "ozempic", "mounjaro",
+        ],
+        "max_bullets": 5,
+    },
+    "metabolic_weight": {
+        "label": "Metabolic & Weight",
+        "keywords": [
+            "insulin", "insulin resistance", "insulin sensitive",
+            "insulin sensitivity", "a1c", "hba1c", "glucose",
+            "post-prandial", "postprandial", "cgm", "continuous glucose",
+            "metabolic syndrome", "metabolic health", "obesity", "weight loss",
+            "body fat", "visceral fat", "waist circumference",
+        ],
+        "max_bullets": 4,
+    },
+}
+
+def _topic_hits(text: str) -> Dict[str, int]:
+    """Return topic_id -> hit_count for this text."""
+    txt = text.lower()
+    hits: Dict[str, int] = {}
+    for tid, spec in TOPIC_SPEC.items():
+        count = 0
+        for kw in spec["keywords"]:
+            if kw in txt:
+                count += 1
+        if count > 0:
+            hits[tid] = count
+    return hits
+
+# ---------- Summarization per video ----------
+
+def summarize_video(vid: str,
+                    segments: List[Dict[str, Any]],
+                    meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    segments: list of {"ts": float, "text": str}
+    """
+    # Sort segments by time
+    segments = sorted(segments, key=lambda s: float(s.get("ts", 0.0)))
+
+    # Collect topic-specific segments
+    topic_segments: Dict[str, List[Dict[str, Any]]] = {tid: [] for tid in TOPIC_SPEC.keys()}
+    cleaned_segments: List[Dict[str, Any]] = []
+
+    for seg in segments:
+        text = _normalize_text(seg.get("text", ""))
+        if not text:
+            continue
+        ts = float(seg.get("ts", 0.0))
+
+        hits = _topic_hits(text)
+        seg_obj = {"ts": ts, "text": text}
+
+        if hits:
+            for tid, cnt in hits.items():
+                topic_segments[tid].append({
+                    "ts": ts,
+                    "text": text,
+                    "score": float(cnt) * (1.0 + len(text) / 200.0),
+                })
+        cleaned_segments.append(seg_obj)
+
+    sections: List[Dict[str, Any]] = []
+    tags: List[str] = []
+    general_bullets: List[Dict[str, Any]] = []
+
+    # Build topic sections
+    for tid, spec in TOPIC_SPEC.items():
+        segs = topic_segments[tid]
+        if not segs:
+            continue
+
+        # Deduplicate by text snippet
+        seen = {}
+        for s in segs:
+            key = _truncate(s["text"], limit=140)
+            if key not in seen:
+                seen[key] = s
+        segs = list(seen.values())
+
+        # Sort by score (keyword density * length) then by time
+        segs.sort(key=lambda s: (-float(s.get("score", 0.0)), float(s.get("ts", 0.0))))
+        max_bullets = int(spec.get("max_bullets", 4))
+        top = segs[:max_bullets]
+
+        bullets = []
+        for s in top:
+            bullets.append({
+                "ts": float(s["ts"]),
+                "text": _truncate(s["text"]),
+            })
+
+        if bullets:
+            sections.append({
+                "id": tid,
+                "topic": spec["label"],
+                "bullets": bullets,
+            })
+            tags.append(spec["label"])
+            # contribute top 1–2 to general bullets
+            general_bullets.extend(bullets[:2])
+
+    # Fallback if no topic matches at all
+    if not sections:
+        fallback = []
+        for s in cleaned_segments[:8]:
+            fallback.append({
+                "ts": float(s["ts"]),
+                "text": _truncate(s["text"]),
+            })
+        sections = [{
+            "id": "general",
+            "topic": "General",
+            "bullets": fallback,
+        }]
+        tags.append("General")
+        general_bullets = fallback[:]
+
+    # Ensure we have a reasonably sized general bullet list
+    if not general_bullets:
+        for s in cleaned_segments[:8]:
+            general_bullets.append({
+                "ts": float(s["ts"]),
+                "text": _truncate(s["text"]),
+            })
+
+    # Build summary string from sections
+    summary_parts: List[str] = []
+    for sec in sections:
+        texts = " ".join(b["text"] for b in sec.get("bullets", []))
+        if texts:
+            summary_parts.append(f"{sec['topic']}: {texts}")
+    summary = " ".join(summary_parts)
+    if len(summary) > 1400:
+        summary = summary[:1400].rsplit(" ", 1)[0] + "…"
+
+    info = meta or {}
+    # Normalize published_at field name
+    pub = (
+        info.get("published_at")
+        or info.get("publishedAt")
+        or info.get("date")
+        or ""
+    )
+
+    return {
+        "title": info.get("title", ""),
+        "channel": (
+            info.get("channel")
+            or info.get("author")
+            or info.get("uploader")
+            or info.get("podcaster")
+            or ""
+        ),
+        "published_at": pub,
+        "tags": tags,
+        "sections": sections,
+        "bullets": general_bullets[:8],  # app.py expects this
+        "summary": summary,
+    }
+
+# ---------- Main pipeline ----------
+
+def main() -> None:
+    print(f"[precompute_video_summaries] DATA_DIR = {DATA_ROOT}")
+    print(f"[precompute_video_summaries] chunks path = {CHUNKS_PATH}")
+
+    if not CHUNKS_PATH.exists():
+        raise SystemExit(f"chunks.jsonl not found at {CHUNKS_PATH}")
+
+    vm = _load_video_meta()
+    print(f"[precompute_video_summaries] video_meta.json entries: {len(vm)}")
+
+    videos: Dict[str, List[Dict[str, Any]]] = {}
+
+    # Group transcript segments by video
+    total_lines = 0
+    with CHUNKS_PATH.open(encoding="utf-8") as f:
         for ln in f:
-            j=json.loads(ln)
-            t = normalize(j.get("text",""))
+            total_lines += 1
+            try:
+                j = json.loads(ln)
+            except Exception:
+                continue
+
+            text = _normalize_text(j.get("text", ""))
+            if not text:
+                continue
+
             m = (j.get("meta") or {})
             vid = (
                 m.get("video_id") or m.get("vid") or m.get("ytid") or
                 j.get("video_id") or j.get("vid") or j.get("ytid") or j.get("id")
             )
-            if not vid or not t:
+            if not vid:
                 continue
-            st = _parse_ts(m.get("start", m.get("start_sec", 0)))
-            texts_by_vid[vid].append(t)
-            metas_by_vid[vid].append({"start": st})
 
-    vids = sorted(texts_by_vid.keys())
-    if not vids:
-        raise SystemExit("No videos found in chunks.jsonl")
+            ts = _parse_ts(m.get("start", m.get("start_sec", 0)))
+            videos.setdefault(vid, []).append({"ts": ts, "text": text})
 
-    # 2) centroids (mean of unit-normalized chunk embeddings)
-    centroids = []
-    chunk_embeds_by_vid = {}
-    for vid in vids:
-        chunks = texts_by_vid[vid]
-        X = enc.encode(chunks, normalize_embeddings=True, batch_size=128).astype("float32")
-        chunk_embeds_by_vid[vid] = X
-        c = X.mean(axis=0)
-        c = c / (np.linalg.norm(c) + 1e-12)
-        centroids.append(c)
-    C = np.stack(centroids).astype("float32")
-    OUT_CENT.parent.mkdir(parents=True, exist_ok=True)
-    np.save(OUT_CENT, C)
-    OUT_IDS.write_text("\n".join(vids), encoding="utf-8")
+    print(f"[precompute_video_summaries] total JSONL lines: {total_lines}")
+    print(f"[precompute_video_summaries] videos detected: {len(videos)}")
 
-    # 3) sentence-level extractive bullets
-    # DF over words across videos
-    DF = Counter()
-    for vid in vids:
-        seen = set()
-        for chunk in texts_by_vid[vid]:
-            for sent in sent_tokenize(chunk):
-                for w in set(sent.lower().split()):
-                    if w in seen: continue
-                    DF[w] += 1
-                    seen.add(w)
-    N_videos = max(1, len(vids))
-
-    def tfidf_sentence(sent: str) -> float:
-        words = [w for w in sent.lower().split() if w]
-        tf = Counter(words)
-        val=0.0
-        for w,cnt in tf.items():
-            df = DF.get(w,1)
-            idf = math.log((N_videos+1)/(df+0.5))
-            val += cnt * idf
-        return val / (len(words)+1e-6)
-
-    summaries = {}
-    for v_idx, vid in enumerate(vids):
-        info = vm.get(vid,{})
-        title = info.get("title") or ""
-        channel = info.get("channel") or info.get("podcaster") or ""
-        pub = info.get("published_at") or info.get("publishedAt") or info.get("date") or ""
-
-        # candidate sentences with timestamps (from chunk start)
-        sentences = []
-        chunk_list = texts_by_vid[vid]
-        for i_chunk, chunk in enumerate(chunk_list):
-            start_ts = metas_by_vid[vid][i_chunk]["start"]
-            for sent in sent_tokenize(chunk):
-                sentences.append({"text": sent, "ts": float(start_ts), "chunk_idx": i_chunk})
-
-        if not sentences:
-            summaries[vid] = {
-                "title": title, "channel": channel, "published_at": pub,
-                "bullets": [], "key_terms": [], "metrics": {"coverage":0.0, "redundancy":0.0, "n_bullets":0}
-            }
+    summaries: Dict[str, Any] = {}
+    for i, (vid, segs) in enumerate(videos.items(), start=1):
+        if not segs:
             continue
+        meta = vm.get(vid, {})
+        sv = summarize_video(vid, segs, meta)
+        summaries[vid] = sv
+        if i % 20 == 0:
+            print(f"  summarized {i} videos...")
 
-        # embed sentences to score with centroid and novelty
-        S_txt = [s["text"] for s in sentences]
-        S_emb = enc.encode(S_txt, normalize_embeddings=True, batch_size=128)
-        c = C[v_idx].reshape(1, -1)
-        cos = (S_emb @ c.T).ravel()
-
-        # position prior: earlier sentences get mild boost
-        ts_all = np.array([s["ts"] for s in sentences], dtype="float32")
-        if len(ts_all)>0:
-            tmax = max(1.0, float(ts_all.max()))
-            pos_prior = np.exp(-ts_all / (0.25*tmax))
-        else:
-            pos_prior = np.ones(len(sentences), dtype="float32")
-
-        tfidf_vals = np.array([tfidf_sentence(s["text"]) for s in sentences], dtype="float32")
-        raw_score = 0.45*tfidf_vals + 0.45*cos + 0.10*pos_prior
-
-        # MMR-like selection + time/window dedup
-        keep = []
-        keep_emb = []
-        keep_times = []
-        time_window = 15.0
-        sim_thresh = 0.85
-        jac_thresh = 0.60
-
-        order = list(np.argsort(-raw_score))
-        for idx in order:
-            s = sentences[idx]; e = S_emb[idx]; t = s["ts"]
-            words = set(s["text"].lower().split())
-
-            duplicate = False
-            for ke, kt, ks in zip(keep_emb, keep_times, keep):
-                if abs(t-kt) <= time_window:
-                    if float(np.dot(e, ke)) >= sim_thresh:
-                        duplicate = True; break
-                    if _jaccard(words, set(ks["text"].lower().split())) >= jac_thresh:
-                        duplicate = True; break
-            if duplicate: 
-                continue
-
-            keep.append(s); keep_emb.append(e); keep_times.append(t)
-            if len(keep) >= 10: break
-
-        keep_sorted = sorted(keep, key=lambda x: x["ts"])
-
-        # metrics
-        redundancy = 0.0
-        if len(keep_emb) > 1:
-            E = np.vstack(keep_emb)
-            sims = E @ E.T
-            np.fill_diagonal(sims, 0.0)
-            redundancy = float(np.mean(np.max(sims, axis=1)))
-
-        kept_idx = [S_txt.index(k["text"]) for k in keep_sorted]
-        coverage = float(tfidf_vals[kept_idx].sum() / (tfidf_vals.sum()+1e-9))
-
-        # key terms over kept bullets
-        term_counter = Counter()
-        for b in keep_sorted:
-            for w in set(b["text"].lower().split()):
-                term_counter[w] += 1
-        key_terms = [w for w,_ in term_counter.most_common(12)]
-
-        # spans inside the source chunk
-        bullets=[]
-        for b in keep_sorted:
-            ci = b["chunk_idx"]
-            chunk_text = chunk_list[ci]
-            text = b["text"]
-            start = chunk_text.find(text)
-            span = [start, start+len(text)] if start >= 0 else [-1, -1]
-            bullets.append({
-                "ts": float(b["ts"]),
-                "text": text,
-                "chunk_idx": int(ci),
-                "span": span
-            })
-
-        summaries[vid] = {
-            "title": title,
-            "channel": channel,
-            "published_at": pub,
-            "bullets": bullets,
-            "key_terms": key_terms,
-            "metrics": {"coverage": round(coverage,4), "redundancy": round(redundancy,4), "n_bullets": len(bullets)}
-        }
-
-    OUT_SUM.parent.mkdir(parents=True, exist_ok=True)
-    OUT_SUM.write_text(json.dumps(summaries, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Wrote: {OUT_CENT}, {OUT_IDS}, {OUT_SUM}  (videos={len(vids)})")
+    VID_SUM_JSON.parent.mkdir(parents=True, exist_ok=True)
+    VID_SUM_JSON.write_text(
+        json.dumps(summaries, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"[precompute_video_summaries] wrote {len(summaries)} summaries to {VID_SUM_JSON}")
 
 if __name__ == "__main__":
     main()
